@@ -355,7 +355,7 @@ async function startSock() {
             if (isFirstTime && rawText.length > 0 && !rawText.startsWith(PREFIX)) {
                 
                 const welcomeMessage = `
-Halo anda telah menghubungi fadil silakhan tunggu saya merespon atau.
+Halo anda telah menghubungi fadil silahkan tunggu saya merespon atau.
 
     Ketik: \`2\`
     untuk memulai percakapan dengan chatbot.
@@ -364,7 +364,7 @@ Halo anda telah menghubungi fadil silakhan tunggu saya merespon atau.
     (untuk keluar dari percakapan chatbot dan kembali menghubungi nomor ini).
 
 *Petunjuk Singkat:*
-- Untuk bertanya/kirim media, aktifkan sesi dengan \`2\` terlebih dahulu.
+- Untuk bertanya/kirim media dengan chatbot, aktifkan sesi dengan \`2\` terlebih dahulu.
 - Ketik \`${PREFIX}menu\` untuk melihat daftar fitur lengkap.
                 `.trim();
 
