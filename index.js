@@ -10,31 +10,11 @@ const {
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
 const setting = require('./setting'); 
-const mammoth = require('mammoth'); 
-const XLSX = require('xlsx'); 
-const pptx2json = require('pptx2json'); 
 const fs = require('fs'); 
 const path = require('path');
 // --- Pustaka Tambahan untuk QR Code ---
 const Jimp = require('jimp'); 
 const jsQR = require('jsqr'); 
-// 💡 PUSTAKA UNTUK TOR & SCRAPING
-const nodeFetch = require('node-fetch'); 
-const fetch = nodeFetch.default || nodeFetch; // PERBAIKAN: Mengambil fungsi fetch yang benar
-const { SocksProxyAgent } = require('socks-proxy-agent'); 
-const cheerio = require('cheerio'); 
-
-// 💡 KONSTANTA UNTUK TOR (Diperbaiki untuk Remote DNS Resolution)
-const TOR_SOCKS_PROXY = 'socks5://127.0.0.1:9050'; 
-
-// 1. Ubah protokol ke socks5h untuk memaksa resolusi DNS oleh Tor Daemon
-const TOR_SOCKS_PROXY_URL = new URL(TOR_SOCKS_PROXY);
-TOR_SOCKS_PROXY_URL.protocol = 'socks5h:'; 
-
-// 2. Gunakan URL yang dimodifikasi ini untuk Agent
-const TOR_AGENT = new SocksProxyAgent(TOR_SOCKS_PROXY_URL); 
-// ----------------------------------------------------
-
 
 // --- KONSTANTA BARU: Batas Ukuran File (Dua Batasan) ---
 const MAX_DOC_SIZE_BYTES = 100 * 1024 * 1024;   // 100 MB untuk Dokumen
@@ -49,12 +29,18 @@ const SPAM_TIME_WINDOW = 10000; // 10 detik
 const RANDOM_DELAY_MIN = 1000;  // 1 detik (Delay minimum mengetik/merespon)
 const RANDOM_DELAY_MAX = 5000;  // 5 detik (Delay maksimum mengetik/merespon)
 const PROCESS_DELAY_MIN = 3000; // 3 detik (Waktu proses AI/Loading)
-const PROCESS_DELAY_MAX = 8000; // 8 detik 
+const PROCESS_DELAY_MAX = 10000; // Ditingkatkan dari 8 detik menjadi 10 detik
+const API_TIMEOUT_MS = 60000; // Tambahkan timeout API 60 detik (1 menit)
 
 // --- KONSTANTA BARU: Penjadwalan Status ---
 const STATUS_REPORT_INTERVAL_MS = 2 * 60 * 1000; // 2 menit
 const TARGET_JID = setting.TARGET_JID; // Diambil dari setting.js
 // ------------------------------------------
+
+// --- KONSTANTA BARU: KONFIGURASI RETRY (5x) ---
+const MAX_RETRIES = 5; 
+// --------------------------------------------------------------------
+
 
 // --- FUNGSI BARU: Jeda Acak (Mempersonalisasi Waktu Respon) ---
 function sleep(ms) {
@@ -132,85 +118,27 @@ const GOOGLE_SEARCH_CONFIG = setting.GOOGLE_SEARCH_CONFIG;
 const PRIVATE_CHAT_STATUS = setting.PRIVATE_CHAT_STATUS; 
 
 
-// --- FUNGSI BARU: Pencarian di Jaringan Tor (IMPLEMENTASI KONEKSI + SCRAPER DASAR) ---
-/**
- * Mencoba melakukan pencarian melalui jaringan Tor dan mengurai hasilnya untuk mengekstrak tautan.
- * ERROR HANDLING DIUBAH UNTUK MEMAKSA AI MENGANALISIS KONTEKS.
- */
-async function torSearch(query) {
-    console.log(`[TOR SEARCH] Mencoba mencari di Tor dan mengindeks tautan untuk: "${query}"`);
+// --- FUNGSI BARU: EKSTRAKSI URL UMUM (UNTUK DETEKSI ANCAMAN) ---
+function extractDangerousUrl(text) {
+    // Regex yang mendeteksi http/https URL, mengabaikan wa.me/chat.whatsapp.com yang umumnya aman.
+    const urlRegex = /(https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|www\.[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9]+\.[^\s]{2,}|www\.[a-zA-Z0-9]+\.[^\s]{2,})/gi;
+    
+    // Filter untuk mengabaikan tautan WhatsApp/YouTube/Social Media yang sudah ditangani secara spesifik
+    const safeDomains = /youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com|facebook\.com|fb\.watch|tiktok\.com|t\.me|wa\.me|chat\.whatsapp\.com/i;
 
-    const MAX_LINKS = 5;
-    const ONION_SEARCH_URL = `http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/?q=${encodeURIComponent(query)}`;
-    const TOR_TIMEOUT = 45000; // 45 detik
-
-    try {
-        console.log(`[TOR KONEKSI] Mengirim permintaan ke: ${ONION_SEARCH_URL}`);
-        
-        const response = await fetch(ONION_SEARCH_URL, { 
-            agent: TOR_AGENT, 
-            timeout: TOR_TIMEOUT, 
-            signal: AbortSignal.timeout(TOR_TIMEOUT) 
-        }); 
-
-        if (!response.ok) {
-            // Jika HTTP error (404, 500, dll), kita tetap berikan konteks netral
-            return `[Gagal HTTP Tor: ${response.status}]. Jaringan Tor terakses, namun situs target (${response.status} - tidak responsif/link mati). Data tidak dapat diindeks.`;
+    const matches = text.match(urlRegex) || [];
+    const uniqueUrls = new Set();
+    
+    matches.forEach(url => {
+        // Hanya tambahkan jika tidak termasuk domain yang sudah ditangani/dianggap relatif "aman"
+        if (!safeDomains.test(url)) {
+            uniqueUrls.add(url);
         }
+    });
 
-        const html = await response.text();
-        const $ = cheerio.load(html); // Menggunakan Cheerio untuk memuat HTML
-        
-        let foundLinks = [];
-        let linkSet = new Set(); 
-
-        // Logika Scraper: Targetkan tautan hasil pencarian
-        $('a').each((i, link) => {
-            const href = $(link).attr('href');
-            const title = $(link).text().trim().replace(/\s+/g, ' '); 
-            
-            if (href && href.startsWith('http')) {
-                // DuckDuckGo membungkus tautan, kita coba temukan URL di dalamnya
-                const urlMatch = href.match(/uddg=(.*?)$/); 
-                let finalUrl = urlMatch ? decodeURIComponent(urlMatch[1]) : href;
-
-                // Hanya ambil tautan .onion dan pastikan unik
-                if (finalUrl.includes('.onion') && !linkSet.has(finalUrl) && foundLinks.length < MAX_LINKS) {
-                    foundLinks.push({ title: title, url: finalUrl });
-                    linkSet.add(finalUrl);
-                }
-            }
-        });
-        
-        let resultString = `✅ PENCARIAN TOR BERHASIL. Ditemukan ${foundLinks.length} Tautan Onion (Max: ${MAX_LINKS}).`;
-
-        if (foundLinks.length > 0) {
-            resultString += "\n\n*Tautan Terindeks (Untuk Analisis Agent Mole):*";
-            foundLinks.forEach((link, index) => {
-                resultString += `\n${index + 1}. *[${link.title || 'Tanpa Judul'}]*\n   URL: \`${link.url}\``;
-            });
-            resultString += "\n\n*Instruksi Lanjutan:* Gunakan tautan terindeks di atas untuk mendapatkan konteks atau referensi dalam jawaban Anda.";
-        } else {
-            resultString += "\nTidak ada tautan .onion relevan yang berhasil diekstrak. Mungkin perlu menyesuaikan query atau selektor HTML.";
-        }
-        
-        return resultString; 
-
-    } catch (error) {
-        // 💡 PERBAIKAN UTAMA: Mengganti semua error koneksi/DNS dengan pesan netral yang menunjukkan kegagalan akses sumber intelijen.
-        console.error("🚨 GAGAL KONEKSI/PARSING TOR:", error.message);
-        
-        // Pesan netral yang masih bisa dianalisis oleh AI
-        if (error.code === 'ECONNREFUSED' || error.message.includes('ECONNREFUSED')) {
-            return `❌ Akses Tor Gagal (Koneksi Ditolak). Sumber intelijen TOR tidak dapat diakses saat ini. Lanjutkan analisis berdasarkan informasi publik (Google Search) dan System Instruction.`;
-        }
-        if (error.type === 'AbortError' || error.name === 'AbortError' || error.message.includes('timeout')) {
-            return `❌ Akses Tor Gagal (Timeout). Sumber intelijen TOR terlalu lambat. Lanjutkan analisis berdasarkan informasi publik (Google Search) dan System Instruction.`;
-        }
-        
-        return `❌ Akses Tor Gagal (Error Umum). Lanjutkan analisis berdasarkan informasi publik (Google Search) dan System Instruction.`;
-    }
+    return Array.from(uniqueUrls);
 }
+// ----------------------------------------------------
 
 
 // --- FUNGSI BARU UNTUK DECODE QR CODE ---
@@ -327,7 +255,7 @@ function extractMessagingInfo(text) {
     // Mencari pattern username Telegram (@user) atau format link invite (t.me/joinchat)
     const telegramRegex = /(?:t\.me\/[\w\-\.]+)|(?:\@[\w\-\.]+)/i;
     // Mencari pattern link WhatsApp (wa.me/nomor) atau grup invite
-    const whatsappRegex = /(?:wa\.me\/\d+)|(?:chat\.whatsapp\.com\/[\w\d]+)/i;
+    const whatsappRegex = /(?:wa\.me\/\d+)|(?:chat\.whatsapp.com\/[\w\d]+)/i;
 
     let info = { telegram: null, whatsapp: null };
     
@@ -356,74 +284,24 @@ function highlightTimestamps(text) {
 }
 
 
-// --- Fungsi Helper Ekstraksi Dokumen ---
+// --- Fungsi Helper Ekstraksi Dokumen (Dibatasi ke PDF/Teks) ---
 async function extractTextFromDocument(buffer, mimeType) {
-    // Efisiensi: File yang didukung native Mole/Google AI dikembalikan cepat
+    // Hanya izinkan PDF dan tipe teks/kode yang didukung native oleh Gemini.
     if (mimeType === 'application/pdf' || mimeType === 'text/plain' || mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/javascript') {
-        return null; 
+        return null; // Null berarti kirim buffer langsung ke Gemini API (native support)
     }
-
-    // Ekstraksi DOCX/DOC (Mammoth)
-    if (mimeType.includes('wordprocessingml.document') || mimeType === 'application/msword') {
-        try {
-            const result = await mammoth.extractRawText({ buffer: buffer });
-            return `*Dokumen DOCX/DOC (Dikonversi ke Teks):*\n\n${result.value}`;
-        } catch (error) {
-            console.error("Gagal ekstraksi DOCX:", error);
-            return "*[GAGAL EKSTRAKSI DARI DOCX/DOC]*. Coba lagi atau pastikan format file valid.";
-        }
-    } 
-    // Ekstraksi XLSX/XLS (SheetJS)
-    else if (mimeType.includes('spreadsheetml.sheet') || mimeType === 'application/vnd.ms-excel') {
-        try {
-            const workbook = XLSX.read(buffer, { type: 'buffer' });
-            let allSheetText = "";
-
-            workbook.SheetNames.forEach(sheetName => {
-                const worksheet = workbook.Sheets[sheetName];
-                const csv = XLSX.utils.sheet_to_csv(worksheet);
-                const truncatedCsv = csv.substring(0, 10000); 
-
-                allSheetText += `\n*-- SHEET: ${sheetName} (Dikonversi ke CSV) --*\n\`\`\`csv\n${truncatedCsv}\n\`\`\``;
-            });
-
-            return `*Dokumen XLSX/XLS (Data Dikonversi ke CSV):*\n${allSheetText}`;
-        } catch (error) {
-            console.error("Gagal ekstraksi XLSX:", error);
-            return "*[GAGAL EKSTRAKSI DARI XLSX/XLS]*. Coba lagi atau pastikan format file valid.";
-        }
-    } 
-    // Ekstraksi PPTX (pptx2json)
-    else if (mimeType.includes('presentationml.presentation')) {
-        try {
-            const slidesData = await pptx2json.extract(buffer);
-            let extractedText = "";
-
-            slidesData.forEach((slide, index) => {
-                const slideText = Array.isArray(slide.text) ? slide.text.join('\n') : slide.text;
-                const notes = slide.notes || 'Tidak ada catatan pembicara.';
-
-                extractedText += `\n\n*-- SLIDE ${index + 1} --*`;
-                extractedText += `\n*Isi Slide:*\n${slideText || 'Tidak ada teks utama.'}`;
-                extractedText += `\n*Catatan Pembicara:*\n${notes}`;
-            });
-            
-            return `*Dokumen PPTX (Dikonversi ke Teks Per Slide):*\n${extractedText}`;
-
-        } catch (error) {
-            console.error("Gagal ekstraksi PPTX:", error);
-            return "*[GAGAL EKSTRAKSI DARI PPTX]*. Coba lagi atau pastikan format file valid.";
-        }
-    }
-    return `*Dokumen Tipe Tidak Dikenal:* ${mimeType}`;
+    
+    // Mengembalikan string jika tipe file tidak didukung
+    return `*Dokumen Tipe Tidak Dikenal:* ${mimeType}`; 
 }
 
 
 // --- Fungsi Helper untuk Sesi Chat (Ingatan Otomatis & Tools) ---
-function getOrCreateChat(jid) {
-    const selectedModel = GEMINI_MODEL_MAP.get(jid) || MODELS.DEFAULT;
+function getOrCreateChat(jid, forceModel = null) {
+    const selectedModel = forceModel || GEMINI_MODEL_MAP.get(jid) || MODELS.DEFAULT;
     
-    if (CHAT_SESSIONS.has(jid)) {
+    // Jika tidak dipaksa modelnya, cek apakah sesi yang ada sudah menggunakan model yang benar
+    if (!forceModel && CHAT_SESSIONS.has(jid)) {
         const chatInstance = CHAT_SESSIONS.get(jid);
         if (chatInstance.model !== selectedModel) {
             CHAT_SESSIONS.delete(jid); 
@@ -431,13 +309,21 @@ function getOrCreateChat(jid) {
              return chatInstance;
         }
     }
+    
+    // Jika dipaksa (untuk failover), hapus sesi lama untuk membuat yang baru dengan model berbeda
+    if (forceModel && CHAT_SESSIONS.has(jid)) {
+        CHAT_SESSIONS.delete(jid);
+    }
+
 
     let chatConfig = {
         config: {
             // 💡 Google Search Tool AKTIF
             tools: setting.GOOGLE_SEARCH_CONFIG.apiKey && setting.GOOGLE_SEARCH_CONFIG.cx ? [{ googleSearch: setting.GOOGLE_SEARCH_CONFIG }] : [], 
             // SMART Mode System Instruction diambil dari setting.js
-            ...(selectedModel === MODELS.SMART && { systemInstruction: SMART_MODE_SYSTEM_INSTRUCTION })
+            ...(selectedModel === MODELS.SMART && { systemInstruction: SMART_MODE_SYSTEM_INSTRUCTION }),
+             // Set Timeout untuk API Call
+            timeout: API_TIMEOUT_MS,
         }
     };
     
@@ -526,16 +412,21 @@ function extractMessageText(m) {
 
 
 // --- Fungsi Utama untuk Berbicara dengan Agent Mole (Ingatan Aktif dan Multimodal) ---
-async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
+async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFailover = false) {
+    let response = null;
+    let lastError = null;
+
+    // Tentukan model awal. Jika ini adalah failover, gunakan FAST mode.
+    const initialModel = isFailover ? MODELS.FAST : (GEMINI_MODEL_MAP.get(from) || MODELS.DEFAULT);
+    
     try {
         // 🛡️ Tahap 1: Tampilkan status ONLINE saat AI berpikir/memproses
         await sock.sendPresenceUpdate('available', from);
         
         const hasMedia = mediaParts.length > 0;
         
-        console.log(`[AGENT MOLE] Memulai permintaan. Media: ${hasMedia ? mediaParts[0].inlineData?.mimeType || mediaParts[0].fileData?.mimeType : 'none'}`); 
+        console.log(`[AGENT MOLE] Memulai permintaan. Media: ${hasMedia ? mediaParts[0].inlineData?.mimeType || mediaParts[0].fileData?.mimeType : 'none'}. Mode: ${initialModel}${isFailover ? ' (FAILOVER)' : ''}`); 
 
-        // Dapatkan Waktu Server Saat Ini (WIB)
         const now = new Date();
         const serverTime = now.toLocaleString('id-ID', {
             weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
@@ -543,49 +434,42 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
             timeZoneName: 'short', timeZone: 'Asia/Jakarta'
         });
 
-        const chat = getOrCreateChat(from);
+        // Hapus sesi saat ini untuk membuat sesi baru dengan model yang benar (penting untuk failover)
+        const chat = getOrCreateChat(from, initialModel);
         const currentModel = chat.model;
 
         let contents = [...mediaParts];
         let finalQuery;
         
-        
-        // ===================================================================
-        // 💡 PERBAIKAN LOGIKA TOR SEARCH: Panggil jika ada teks DAN bukan media, ATAU jika mengandung URL Dark Web
-        // ===================================================================
-        const DARKWEB_URL_REGEX = /(\.onion\/|\.onion$)/i;
-        
-        const isDarkWebQuery = textQuery.length > 0 && DARKWEB_URL_REGEX.test(textQuery);
-        const isSimpleTextQuery = textQuery.length > 0 && mediaParts.length === 0;
-
-        let torSearchResults = '';
-        
-        // 1. Lakukan Tor Search jika itu teks biasa ATAU jika ada URL Dark Web di teks
-        if (isSimpleTextQuery || isDarkWebQuery) {
-            // 🛡️ Humanisasi: Tampilkan status 'typing' saat mencari di Tor (simulasi waktu Tor)
-            await sock.sendPresenceUpdate('composing', from); 
-            torSearchResults = await torSearch(textQuery); 
-            // Setelah pencarian Tor selesai, kembalikan ke 'available' sebelum melanjutkan
-            await sock.sendPresenceUpdate('available', from);
-        }
-
         const roleInjection = "Sebagai Agent Mole, seorang spesialis forensik, proses permintaan ini dan berikan respons yang profesional dan terstruktur. ";
         
-        // 2. Optimasi Alur: Menggabungkan logika query
-        if (textQuery.length > 0) {
-            
-            // Instruksi dasar, biarkan Gemini yang memutuskan menggunakan Google Search Tool
-            let contextInjection = `*TANGGAL/WAKTU SERVER SAAT INI:* \`${serverTime}\`. `;
-            
-            // Suntikkan hasil Tor Search ke dalam prompt sebagai konteks jika dilakukan
-            if (torSearchResults.length > 0) {
-                 contextInjection += `*KONTEKS DARI JARINGAN TOR TAMBAHAN:* \`\`\`\n${torSearchResults}\n\`\`\``;
-            }
-            
-            // Instruksi untuk menggunakan Tool Google Search tetap dipertahankan
-            const googleSearchInstruction = "Gunakan Tool Google Search untuk mendapatkan informasi yang akurat, real-time yang relevan dengan pertanyaan pengguna.";
+        // --- DETEKSI DAN INSTRUKSI UNTUK ANCAMAN URL UMUM ---
+        const dangerousUrls = extractDangerousUrl(textQuery);
+        let threatInstruction = '';
 
-            finalQuery = `${contextInjection}\n\n${roleInjection} ${googleSearchInstruction} *Permintaan Pengguna:*\n${textQuery}`;
+        if (dangerousUrls.length > 0) {
+            const urlList = dangerousUrls.map(url => `\`${url}\``).join(', ');
+            
+            dangerousUrls.forEach(url => {
+                 textQuery = textQuery.replace(new RegExp(url.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi'), '').trim();
+            });
+
+            threatInstruction = (
+                `*⚠️ DETEKSI ANCAMAN URL:* Tautan potensial berbahaya terdeteksi: ${urlList}. ` +
+                `*PRIORITAS*: Gunakan Tool Google Search (Web Search) untuk melakukan analisis keamanan pada setiap URL ini. Cari bukti terkait *scam*, *phishing*, *malware*, atau laporan negatif lainnya. ` +
+                `Sertakan laporan risiko keamanan yang komprehensif sebagai bagian dari jawaban Anda.`
+            );
+        }
+        // ----------------------------------------------------
+        
+        if (textQuery.length > 0 || threatInstruction.length > 0) {
+            
+            let contextInjection = `*TANGGAL/WAKTU SERVER SAAT INI:* \`${serverTime}\`. `;
+            const googleSearchInstruction = "Gunakan Tool Google Search (Web Search) untuk mendapatkan informasi yang akurat, real-time, dan relevan dengan pertanyaan pengguna.";
+            
+            const combinedQuery = `${threatInstruction}\n\n${textQuery}`.trim();
+
+            finalQuery = `${contextInjection}\n\n${roleInjection} ${googleSearchInstruction} *Permintaan Pengguna:*\n${combinedQuery}`;
             contents.push(finalQuery);
             
         } else if (mediaParts.length > 0) {
@@ -593,11 +477,10 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
              const isAudio = mediaPart.inlineData?.mimeType.startsWith('audio');
              const mediaType = isAudio ? 'voice note/audio' : (mediaPart.fileData ? 'video/URL' : (mediaPart.inlineData?.mimeType.startsWith('image') ? 'gambar' : 'dokumen'));
              
-             // Prompt Media (Audio/Video/Dokumen)
              if (isAudio) {
                  finalQuery = 
                     `${serverTime}\n\n${roleInjection}*Permintaan Audio:*\n` +
-                    'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal (misalnya: berita, harga, cuaca), *Gunakan Tool Google Search* untuk mendapatkan jawaban yang akurat. ' +
+                    'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal (misalnya: berita, harga, cuaca), *Gunakan Tool Google Search (Web Search)* untuk mendapatkan jawaban yang akurat. ' +
                     'Setelah itu, balaslah isi pesan tersebut dengan jawaban yang relevan dan personal. Di akhir jawaban Anda, berikan juga transkripsi dan ringkasan Voice Note sebagai referensi.';
 
              } else {
@@ -605,43 +488,77 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
              }
              contents.push(finalQuery);
         } else {
-             // 💡 Menggunakan nama Agent Mole untuk respons default.
              finalQuery = 
-                `${serverTime}\n\n*Pesan Default:*\nHalo! Saya Agent Mole, siap membantu analisis kasus Anda. Anda bisa mengajukan pertanyaan, mengirim gambar, video, dokumen (PDF/TXT/DOCX/XLSX/PPTX), atau *voice note* setelah me-*tag* saya. Ketik ${PREFIX}menu untuk melihat daftar perintah.`;
+                `${serverTime}\n\n*Pesan Default:*\nHalo! Saya Agent Mole, siap membantu analisis kasus Anda. Anda bisa mengajukan pertanyaan, mengirim gambar, video, dokumen (PDF/TXT/Code), atau *voice note* setelah me-*tag* saya. Ketik ${PREFIX}menu untuk melihat daftar perintah.`;
              contents.push(finalQuery);
         }
         
-        // Cek apakah contents hanya berisi satu string (kasus non-media), ubang formatnya
         const finalContents = mediaParts.length === 0 && contents.length === 1 ? contents[0] : contents;
         
-        console.log(`[AGENT MOLE] Mengirim pesan ke model: ${currentModel}. Media parts: ${mediaParts.length}`); 
+        // --- LOGIKA RETRY DITERAPKAN DI SINI ---
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                console.log(`[AGENT MOLE] Mengirim pesan ke model: ${currentModel}. Percobaan ke-${attempt}/${MAX_RETRIES}`); 
+                
+                // Jeda Proses AI (Waktu yang Dihabiskan untuk Loading)
+                const processDelay = Math.floor(Math.random() * (PROCESS_DELAY_MAX - PROCESS_DELAY_MIN + 1)) + PROCESS_DELAY_MIN;
+                console.log(`[HUMANISASI] Mensimulasikan proses AI selama ${processDelay}ms... (Status: Online)`);
+                await sleep(processDelay);
+                
+                // Kirim pesan dengan konfigurasi timeout dari objek chat
+                response = await chat.sendMessage({ message: finalContents });
+                
+                console.log(`[AGENT MOLE] Respons diterima pada percobaan ke-${attempt}.`); 
+                break; // Keluar dari loop jika berhasil
+
+            } catch (error) {
+                lastError = error;
+
+                // Cek error 503 atau pesan yang mengindikasikan server overload/timeout
+                const isRetryableError = error.status === 503 || error.message.includes('503') || error.message.includes('overloaded') || error.message.includes('UNAVAILABLE') || error.message.includes('timeout');
+                
+                if (attempt < MAX_RETRIES && isRetryableError) {
+                    // Exponential Backoff dengan Jitter: 2^n * 1000ms + random(1000ms)
+                    const delayTime = Math.pow(2, attempt) * 1500 + Math.random() * 2000; // Meningkatkan basis delay
+                    console.warn(`[RETRY WARNING] Percobaan ke-${attempt} gagal (Status ${error.status || 'Unknown'}). Mencoba lagi dalam ${Math.round(delayTime / 1000)} detik.`);
+                    await sleep(delayTime);
+                } else if (isRetryableError && !isFailover && currentModel === MODELS.SMART) {
+                     // Ini adalah kegagalan 503 final pada Smart Mode, lakukan Failover.
+                     console.warn(`[FAILOVER] Smart Mode gagal setelah ${MAX_RETRIES} percobaan. Mencoba sekali di Fast Mode.`);
+                     
+                     // Panggil fungsi ini sendiri untuk melakukan 1x percobaan Fast Mode
+                     await handleGeminiRequest(sock, from, textQuery, mediaParts, true); 
+                     return; // Keluar dari fungsi utama, respons akan ditangani oleh panggilan failover
+
+                } else if (isRetryableError) {
+                     // Ini adalah kegagalan 503 final (atau kegagalan failover)
+                     console.error(`[FATAL ERROR 503] Semua ${MAX_RETRIES} percobaan gagal.`, error.message);
+                     throw new Error("Model terlalu sibuk (503). Mohon coba lagi nanti.");
+                } else {
+                    // Ini adalah error non-retryable (400, 429, dll.)
+                    throw error;
+                }
+            }
+        }
         
-        // --- Jeda Proses AI (Waktu yang Dihabiskan untuk Loading) ---
-        const processDelay = Math.floor(Math.random() * (PROCESS_DELAY_MAX - PROCESS_DELAY_MIN + 1)) + PROCESS_DELAY_MIN;
-        console.log(`[HUMANISASI] Mensimulasikan proses AI selama ${processDelay}ms... (Status: Online)`);
-        await sleep(processDelay);
-        
-        const response = await chat.sendMessage({ message: finalContents });
-        
-        console.log(`[AGENT MOLE] Respons diterima.`); 
+        if (!response) {
+            throw lastError; 
+        }
 
         let geminiResponse = response.text.trim();
         
-        // Sorot Timestamp hanya jika ada media video/youtube
         const isYoutubeAnalysis = mediaParts.some(part => part.fileData && part.fileData.mimeType === 'video/youtube');
         
         if (isYoutubeAnalysis) {
              geminiResponse = highlightTimestamps(geminiResponse);
         }
         
-        // 💡 Kustomisasi display nama dan status model (agar tidak terlihat seperti "Gemini")
         let modelStatus;
         if (currentModel === MODELS.FAST) {
             modelStatus = 'Mole 2.5-flash';
             
-            // 💡 PERBAIKAN PENTING: Mengganti respons default model (di Fast Mode)
             if (geminiResponse.includes('Saya adalah model bahasa besar') || geminiResponse.includes('I am a large language model')) {
-                geminiResponse = 'Saya adalah Agent Mole, model bahasa besar yang digunakan untuk mencari kasus kriminal.'; // Perubahan untuk konsistensi nama
+                geminiResponse = 'Saya adalah Agent Mole, model bahasa besar yang digunakan untuk mencari kasus kriminal.';
             }
 
         } else if (currentModel === MODELS.SMART) {
@@ -650,7 +567,11 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
             modelStatus = currentModel;
         }
 
-        const finalResponse =`*💠 Mode Aktif:* \`${modelStatus}\`\n${geminiResponse}`;
+        let finalResponse =`*💠 Mode Aktif:* \`${modelStatus}\`\n${geminiResponse}`;
+
+        if (isFailover) {
+            finalResponse = `⚠️ *Mode Failover (503 Error)*: Server Smart Mode sedang sibuk. Kami menurunkan mode ke Fast Mode (Mole 2.5-flash) untuk menyelesaikan permintaan Anda.\n\n` + finalResponse;
+        }
 
         // 🛡️ Tahap 2: Tampilkan status COMPOSING (mengetik) sebelum mengirim pesan
         await sock.sendPresenceUpdate('composing', from); 
@@ -660,32 +581,30 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
 
         await sock.sendMessage(from, { text: finalResponse });
         
-        // ------------------------------------------------------------------
-        // *** OPTIMASI EFISIENSI MEMORI: Hapus Sesi Jika Ada Media ***
-        // ------------------------------------------------------------------
-        if (hasMedia) {
-             // 1. Simpan riwayat percakapan berbasis teks dari sesi lama
-             const history = await chat.getHistory();
-             
-             // 2. Hapus sesi lama (membuang buffer media yang besar dari memori)
-             CHAT_SESSIONS.delete(from);
-             
-             // 3. Buat sesi baru (getOrCreateChat akan membuatnya)
-             const newChat = getOrCreateChat(from);
-             
-             // 4. Hapus entri yang mengandung media (non-string parts)
-             const textOnlyHistory = history.filter(msg => {
-                 // Filter hanya pesan yang komponen utamanya adalah string (teks)
-                 return typeof msg.parts[0] === 'string' || (msg.parts.length === 1 && typeof msg.parts[0].text === 'string');
-             });
-             
-             // Hanya simpan 3 pesan terakhir (teks/jawaban) untuk efisiensi lebih lanjut
-             const smallTextHistory = textOnlyHistory.slice(-3);
-             
-             // Tambahkan riwayat teks kembali ke sesi baru
-             newChat.history = smallTextHistory;
-             
-             console.log(`[OPTIMASI MEMORI] Sesi dengan media dihapus. Sesi baru dibuat dengan ${smallTextHistory.length} riwayat teks.`);
+        // --- OPTIMASI EFISIENSI MEMORI ---
+        // Jika mode bukan failover, perbarui status model pengguna
+        if (!isFailover) {
+            if (hasMedia) {
+                 const history = await chat.getHistory();
+                 CHAT_SESSIONS.delete(from);
+                 const newChat = getOrCreateChat(from);
+                 
+                 const textOnlyHistory = history.filter(msg => {
+                     return typeof msg.parts[0] === 'string' || (msg.parts.length === 1 && typeof msg.parts[0].text === 'string');
+                 });
+                 
+                 const smallTextHistory = textOnlyHistory.slice(-3);
+                 newChat.history = smallTextHistory;
+                 
+                 console.log(`[OPTIMASI MEMORI] Sesi dengan media dihapus. Sesi baru dibuat dengan ${smallTextHistory.length} riwayat teks.`);
+            }
+        } else {
+             // Jika failover berhasil, sesi Fast Mode tetap ada, dan kita HANYA perlu menghapus histori jika ada media
+             if (hasMedia) {
+                 CHAT_SESSIONS.delete(from);
+                 getOrCreateChat(from, MODELS.FAST); // Buat ulang sesi fast mode tanpa history media
+             }
+             // *PENTING*: Jangan ubah GEMINI_MODEL_MAP pengguna; biarkan mereka tetap di SMART mode untuk permintaan berikutnya.
         }
         // ------------------------------------------------------------------
 
@@ -702,9 +621,10 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
              errorDetail = "Ukuran file terlalu besar atau kunci API bermasalah. (Error 400 Bad Request)";
         } else if (error.message.includes('500')) {
              errorDetail = "Agent Mole AI mengalami error internal. Coba lagi sebentar."; 
+        } else if (error.message.includes('Model terlalu sibuk')) {
+             errorDetail = "Server AI sedang kelebihan beban. Kami sudah mencoba 5x. Mohon tunggu 5-10 menit dan coba lagi.";
         }
         
-        // 🛡️ Humanisasi: Jeda sebelum kirim pesan error
         await sock.sendPresenceUpdate('composing', from);
         const typingDelay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
         await sleep(typingDelay);
@@ -718,6 +638,9 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = []) {
 
 // --- Fungsi Khusus untuk Image Generation ---
 async function handleImageGeneration(sock, from, prompt) {
+    let response = null;
+    let lastError = null;
+
     try {
         await sock.sendPresenceUpdate('composing', from); 
 
@@ -725,14 +648,52 @@ async function handleImageGeneration(sock, from, prompt) {
 
         console.log(`[AGENT MOLE DRAW] Menerima permintaan: "${prompt}"`); 
         
-        // 🛡️ Humanisasi: Jeda Proses AI sebelum pemanggilan API
-        const processDelay = Math.floor(Math.random() * (PROCESS_DELAY_MAX - PROCESS_DELAY_MIN + 1)) + PROCESS_DELAY_MIN;
-        await sleep(processDelay);
-        
-        const response = await ai.models.generateContent({
-            model: model,
-            contents: [prompt] 
-        });
+        // --- LOGIKA RETRY DITERAPKAN DI SINI ---
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                console.log(`[AGENT MOLE DRAW] Mengirim permintaan. Percobaan ke-${attempt}/${MAX_RETRIES}`); 
+
+                // Jeda Proses AI sebelum pemanggilan API
+                const processDelay = Math.floor(Math.random() * (PROCESS_DELAY_MAX - PROCESS_DELAY_MIN + 1)) + PROCESS_DELAY_MIN;
+                await sleep(processDelay);
+                
+                // Tambahkan config timeout 
+                const imageConfig = {
+                    model: model,
+                    contents: [prompt],
+                    config: {
+                        timeout: API_TIMEOUT_MS,
+                    }
+                };
+
+                response = await ai.models.generateContent(imageConfig);
+                
+                console.log(`[AGENT MOLE DRAW] Respons diterima pada percobaan ke-${attempt}.`); 
+                break; // Keluar dari loop jika berhasil
+            } catch (error) {
+                lastError = error;
+
+                // Cek error 503 atau pesan yang mengindikasikan server overload/timeout
+                const isRetryableError = error.status === 503 || error.message.includes('503') || error.message.includes('overloaded') || error.message.includes('UNAVAILABLE') || error.message.includes('timeout');
+
+                if (attempt < MAX_RETRIES && isRetryableError) {
+                    // Exponential Backoff dengan Jitter: 2^n * 1000ms + random(1000ms)
+                    const delayTime = Math.pow(2, attempt) * 1500 + Math.random() * 2000; 
+                    console.warn(`[RETRY WARNING DRAW] Percobaan ke-${attempt} gagal (Status ${error.status || 'Unknown'}). Mencoba lagi dalam ${Math.round(delayTime / 1000)} detik.`);
+                    await sleep(delayTime);
+                } else if (isRetryableError) {
+                    console.error(`[FATAL ERROR 503 DRAW] Semua ${MAX_RETRIES} percobaan gagal.`, error.message);
+                    throw new Error("Model gambar terlalu sibuk (503). Mohon coba lagi nanti.");
+                } else {
+                    // Error non-retryable
+                    throw error;
+                }
+            }
+        }
+
+        if (!response) {
+             throw lastError;
+        }
 
         const imagePart = response.candidates?.[0]?.content?.parts?.find(
             part => part.inlineData && part.inlineData.mimeType.startsWith('image/')
@@ -766,13 +727,18 @@ async function handleImageGeneration(sock, from, prompt) {
         console.error("🚨 GAGAL MEMPROSES IMAGE GENERATION:", error.message);
         console.error("-----------------------------------------------------");
 
+        let errorDetail = "Terjadi kesalahan saat mencoba membuat gambar.";
+        if (error.message.includes("Model gambar terlalu sibuk")) {
+             errorDetail = "Server AI Image Generator sedang kelebihan beban. Kami sudah mencoba 5x. Mohon tunggu 5-10 menit dan coba lagi.";
+        }
+        
         // 🛡️ Humanisasi: Jeda sebelum kirim pesan error (typing)
         await sock.sendPresenceUpdate('composing', from);
         const typingDelay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
         await sleep(typingDelay);
 
         await sock.sendMessage(from, { 
-            text: "Maaf, terjadi kesalahan saat mencoba membuat gambar dengan Agent Mole. Silakan cek konsol terminal untuk detail error lebih lanjut." 
+            text: `Maaf, terjadi kesalahan saat mencoba membuat gambar dengan Agent Mole.\n\n⚠️ *Detail Error:* ${errorDetail}` 
         });
     } finally {
         await sock.sendPresenceUpdate('available', from); 
@@ -814,18 +780,20 @@ async function changeModel(sock, jid, modelKey) {
 // Fungsi utama untuk menjalankan bot
 async function startSock() {
     try {
+        // --- FOKUS UTAMA: useMultiFileAuthState('baileys_auth_info') ---
+        // Jika folder 'baileys_auth_info' tidak ada, Baileys akan memulai sesi baru.
         const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info'); 
         
         const sock = makeWASocket({
             auth: state,
-            printQRInTerminal: false, 
+            printQRInTerminal: false, // Disetel false karena kita tangani QR di event listener
         });
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                // Tampilkan QR Code hanya saat diminta oleh Baileys
+                // ✅ LOGIKA QR CODE BARU: Dipanggil jika tidak ada sesi tersimpan
                 qrcode.generate(qr, { small: true });
                 console.log("Scan QR code ini dengan WhatsApp kamu!");
             }
@@ -840,7 +808,9 @@ async function startSock() {
                     // Jeda sebentar sebelum mencoba menyambung ulang
                     setTimeout(() => startSock(), 3000); 
                 } else {
-                    console.log('Koneksi ditutup. Anda telah logout.');
+                    console.log('Koneksi ditutup. Anda telah logout (Sesi dihapus).');
+                    // ⚠️ CATATAN PENTING: Jika terjadi DisconnectReason.loggedOut, 
+                    // Anda harus HAPUS folder 'baileys_auth_info' secara manual sebelum menjalankan bot lagi.
                 }
             } else if (connection === 'open') {
                 console.log('Bot siap digunakan! Agent Mole Aktif.');
@@ -1004,7 +974,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay);
                         
-                        await sock.sendMessage(from, { text: "Mohon berikan deskripsi gambar yang ingin Anda buat, contoh: `"+ PREFIX +"draw seekor anjing astronaut di luar angkasa`" });
+                        await sock.sendMessage(from, { text: "Mohon berikan deskripsi gambar yang ingin Anda buat, contoh: `"+ PREFIX +"draw seekor anjing detektif mengenakan topi fedora, gaya noir`" });
                         await sock.sendPresenceUpdate('available', from);
                     }
                     return;
@@ -1099,7 +1069,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     mediaParts.push(bufferToGenerativePart(buffer, videoMsg.mimetype));
                 }
                 
-                // B. Pemrosesan Dokumen
+                // B. Pemrosesan Dokumen (HANYA PDF/Teks)
                 else if (messageType === 'documentMessage' || m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.documentMessage) {
                     const documentMsg = messageType === 'documentMessage' 
                         ? m.message.documentMessage 
@@ -1113,8 +1083,8 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         return;
                     }
 
-                    // List mime types yang didukung (diperpendek untuk efisiensi)
-                    const isSupported = mimeType.includes('pdf') || mimeType.includes('text') || mimeType.includes('json') || mimeType.includes('wordprocessingml') || mimeType.includes('msword') || mimeType.includes('spreadsheetml') || mimeType.includes('presentationml');
+                    // List mime types yang didukung: HANYA PDF, dan tipe teks/kode lain (yang didukung native oleh Gemini API)
+                    const isSupported = mimeType.includes('pdf') || mimeType.includes('text') || mimeType.includes('json') || mimeType.includes('javascript');
 
                     if (isSupported) {
                         isGeminiQuery = true; // Set query flag jika ada media/dokumen
@@ -1129,8 +1099,18 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         documentExtractedText = await extractTextFromDocument(buffer, mimeType);
                         
                         if (!documentExtractedText) {
+                            // Jika null, kirim buffer langsung ke Gemini (untuk PDF, TXT, dll.)
                             mediaParts.push(bufferToGenerativePart(buffer, mimeType));
                             console.log(`[AGENT MOLE API] File ${mimeType} dikirim langsung ke Agent Mole AI.`); 
+                        } else {
+                            // Jika mengembalikan string (yang berarti tipe file tidak didukung)
+                            await sock.sendPresenceUpdate('composing', from);
+                            const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
+                            await sleep(delay);
+
+                            await sock.sendMessage(from, { text: `⚠️ Maaf, tipe file dokumen \`${mimeType}\` belum didukung. Agent Mole hanya mendukung *PDF, TXT, dan tipe file kode/teks* lainnya.` });
+                            await sock.sendPresenceUpdate('available', from);
+                            return;
                         }
 
                     } else {
@@ -1139,7 +1119,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay);
 
-                        await sock.sendMessage(from, { text: `⚠️ Maaf, tipe file dokumen \`${mimeType}\` belum didukung. Hanya mendukung *PDF, TXT, DOCX/DOC, XLSX/XLS, PPTX*, dan berbagai tipe file *kode/teks* lainnya.` });
+                        await sock.sendMessage(from, { text: `⚠️ Maaf, tipe file dokumen \`${mimeType}\` belum didukung. Agent Mole hanya mendukung *PDF, TXT, dan tipe file kode/teks* lainnya.` });
                         await sock.sendPresenceUpdate('available', from);
                         return;
                     }
@@ -1165,7 +1145,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         if (queryText.length === 0) {
                             // *** MODIFIKASI PROMPT EKSPLISIT ***
                             queryText = (
-                                'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal (misalnya: berita, harga, cuaca), *Gunakan Tool Google Search* untuk mendapatkan jawaban yang akurat. ' +
+                                'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal (misalnya: berita, harga, cuaca), *Gunakan Tool Google Search (Web Search)* untuk mendapatkan jawaban yang akurat. ' +
                                 'Setelah itu, balaslah isi pesan tersebut dengan jawaban yang relevan dan personal. Di akhir jawaban Anda, berikan juga transkripsi dan ringkasan Voice Note sebagai referensi.'
                             );
                             // ***************************************************************
@@ -1195,7 +1175,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     // SUNATKAN INSTRUKSI KHUSUS
                     const instagramInstruction = (
                          `*ANALISIS SOSIAL MEDIA - INSTAGRAM:* URL Instagram terdeteksi: \`${instagramUrl}\`. ` +
-                         `Gunakan Tool Google Search untuk mengidentifikasi konten publik yang terkait dengan URL ini dan subjeknya. ` +
+                         `Gunakan Tool Google Search (Web Search) untuk mengidentifikasi konten publik yang terkait dengan URL ini dan subjeknya. ` +
                          `Lakukan analisis ancaman profil/konten berdasarkan URL ini dan semua informasi yang berhasil Anda temukan. ` +
                          `*PERHATIAN*: Anda tidak memiliki akses ke konten pribadi atau login Instagram. Fokus pada informasi publik yang terindeks.`
                     );
@@ -1215,7 +1195,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     
                     socialMediaInstruction = (
                          `*ANALISIS SOSIAL MEDIA - TERDETEKSI:* URL ${otherSocialUrl.includes('facebook') ? 'Facebook' : (otherSocialUrl.includes('x.com') || otherSocialUrl.includes('twitter.com') ? 'X/Twitter' : 'TikTok')} terdeteksi: \`${otherSocialUrl}\`. ` +
-                         `Gunakan Tool Google Search untuk mengidentifikasi konten publik yang terkait dengan URL ini dan subjeknya. ` +
+                         `Gunakan Tool Google Search (Web Search) untuk mengidentifikasi konten publik yang terkait dengan URL ini dan subjeknya. ` +
                          `Lakukan analisis ancaman profil/konten berdasarkan URL ini dan semua informasi publik yang berhasil Anda temukan. ` +
                          `*PERHATIAN*: Anda tidak boleh mencoba akses login atau konten pribadi. Fokus pada informasi publik yang terindeks.`
                     );
@@ -1230,7 +1210,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     
                     socialMediaInstruction = (
                          `*ANALISIS PLATFORM CHAT - TERDETEKSI:* Informasi ${platform} terdeteksi: \`${infoData}\`. ` +
-                         `Gunakan Tool Google Search untuk mencari tautan grup, username, atau informasi publik yang terkait dengan data ini. ` +
+                         `Gunakan Tool Google Search (Web Search) untuk mencari tautan grup, username, atau informasi publik yang terkait dengan data ini. ` +
                          `Berikan analisis risiko keamanan atau potensi ancaman yang terkait. ` +
                          `*PERHATIAN*: Bot tidak dapat mengakses pesan pribadi. Fokus pada informasi yang tersedia di indeks publik.`
                     );
@@ -1260,7 +1240,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                 
                 // --- Eksekusi Agent Mole AI ---
                 // Final check: Pastikan bot merespons jika isGeminiQuery true ATAU ada query teks
-                if (isGeminiQuery || queryText.length > 0) {
+                if (isGeminiQuery || queryText.length > 0 || extractDangerousUrl(messageText).length > 0) {
                     await handleGeminiRequest(sock, from, queryText, mediaParts);
                     return;
                 }
