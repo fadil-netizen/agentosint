@@ -1,7 +1,7 @@
 {
   "name": "wa-bot-baileys",
   "version": "1.0.0",
-  "description": "WhatsApp Bot powered by Baileys and Google Gemini",
+  "description": "WhatsApp Bot powered by Baileys and Google Gemini for OSINT",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -11,9 +11,11 @@
     "whatsapp",
     "baileys",
     "gemini",
-    "ai"
+    "ai",
+    "osint",
+    "forensic"
   ],
-  "author": "",
+  "author": "FADIL (Modified)",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
@@ -22,12 +24,10 @@
     "@whiskeysockets/baileys": "^7.0.0-rc.6",
     "cheerio": "^1.1.2",
     "dotenv": "^17.2.3",
-    "duck-duck-scrape": "^2.2.7",
     "googleapis": "^164.1.0",
     "jimp": "^1.6.0",
     "jsqr": "^1.4.0",
     "node-fetch": "^3.3.2",
-    "pidusage": "^4.0.1",
     "qrcode-terminal": "^0.12.0",
     "socks-proxy-agent": "^7.0.0"
   }
