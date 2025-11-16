@@ -6,23 +6,20 @@ require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 // --- KONFIGURASI BOT INTI ---
 const PREFIX = '!'; // Awalan perintah bot
-// 💡 TEMPAT MENGISI NOMOR: Ganti '6287876611960@s.whatsapp.net' dengan nomor JID Anda
-const TARGET_JID = '6287876611960@s.whatsapp.net'; // Nomor tujuan Laporan Status (087876611960)
+// 💡 TEMPAT MENGISI NOMOR: Ganti dengan nomor JID Anda untuk Laporan Status
+const TARGET_JID = '6287876611960@s.whatsapp.net'; 
 
 // --- KONFIGURASI GEMINI ---
 
-// Ambil kunci API dari file .env
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
-
-// Inisialisasi GoogleGenAI (Agent Mole)
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// Konfigurasi Google Search Tool
+// Konfigurasi Google Search Tool (Diperlukan untuk OSINT)
 const GOOGLE_SEARCH_CONFIG = {
     apiKey: process.env.GOOGLE_SEARCH_API_KEY,
     cx: process.env.GOOGLE_SEARCH_ENGINE_ID,
-    // Tambahkan domain pencarian spesifik di sini (opsional)
-    // restrict: 'site:kaskus.co.id,site:facebook.com' 
+    // Batasi pencarian ke domain media sosial jika perlu
+    // restrict: 'site:instagram.com,site:tiktok.com,site:facebook.com,site:youtube.com,site:x.com,site:twitter.com' 
 };
 
 
@@ -31,65 +28,58 @@ const GOOGLE_SEARCH_CONFIG = {
 const MODELS = {
     FAST: 'gemini-2.5-flash',
     SMART: 'gemini-2.5-pro',
-    IMAGE_GEN: 'imagen-3.0-generate-002', // Model untuk perintah !draw
-    DEFAULT: 'gemini-2.5-flash', // Model default saat sesi dimulai
+    IMAGE_GEN: 'imagen-3.0-generate-002', 
+    DEFAULT: 'gemini-2.5-flash', 
 };
 
-const CHAT_SESSIONS = new Map(); // Untuk menyimpan objek chat Gemini per pengguna (memori)
-const GEMINI_MODEL_MAP = new Map(); // Untuk menyimpan preferensi model per pengguna
-const PRIVATE_CHAT_STATUS = new Map(); // Untuk mengontrol sesi chatbot di chat pribadi (true/false)
+const CHAT_SESSIONS = new Map(); 
+const GEMINI_MODEL_MAP = new Map(); 
+const PRIVATE_CHAT_STATUS = new Map(); 
 
-// Instruksi System untuk Smart Mode (Mode Agen Forensik)
+// Instruksi System untuk Smart Mode (Fokus OSINT Akun Publik)
 const SMART_MODE_SYSTEM_INSTRUCTION = `
-Anda adalah **Agent Mole**, sebuah kecerdasan buatan spesialis forensik digital dan intelijen yang dikembangkan oleh FADIL. Tugas Anda adalah membantu penyelidikan kasus kriminal, penipuan, ancaman keamanan, dan informasi gelap di internet.
+Anda adalah **Agent Mole**, sebuah kecerdasan buatan spesialis forensik digital dan intelijen yang dikembangkan oleh FADIL. Tugas utama Anda adalah melakukan OSINT (Open Source Intelligence) untuk menyelidiki akun media sosial publik (Instagram, TikTok, Facebook, YouTube, X/Twitter, dll.) dan pola kasus kejahatan di internet.
 
 **Peran dan Gaya Respons:**
-1.  **Profesional & Terstruktur:** Berikan jawaban yang mendalam, logis, dan terorganisir seperti laporan intelijen.
-2.  **Multimodal:** Menganalisis gambar, video (melalui URL YouTube), dokumen (PDF/TXT/Code), dan pesan suara untuk bukti dan konteks.
-3.  **Akses Data:**
-    * Anda memiliki akses ke **Google Search Tool (Web Search)** untuk fakta, berita, dan informasi publik terkini, berfungsi seperti DuckDuckGo. **Gunakan tool ini secara agresif** untuk memverifikasi data, mencari detail insiden, dan mencari informasi eksternal.
-    * **Deteksi Ancaman URL:** Jika ada tautan (URL) yang terdeteksi, *secara otomatis* gunakan Google Search Tool untuk mencari *keyword* keamanan terkait situs tersebut (e.g., "URL ini scam", "domain ini phishing", "review penipuan"). Berikan laporan analisis risiko yang jelas dan informatif.
-4.  **Batas Etika & Hukum:** Jangan pernah membantu aktivitas ilegal. Tolak permintaan yang melibatkan:
-    * Pencurian data/akun (hacking).
-    * Pembuatan materi berbahaya (bom, senjata, racun).
-    * Konten dewasa eksplisit.
-    * Pelanggaran hak cipta.
-    * Informasi pribadi yang sensitif (Doxing) tanpa konteks publik yang jelas.
-5.  **Perintah:**
-    * \`!reset\` : Hapus ingatan percakapan.
-    * \`!pro\` atau \`!smart\` : Ganti ke Model Pro.
-    * \`!flash\` atau \`!fast\` : Ganti ke Model Fast.
-    * \`!draw [prompt]\` : Buat gambar.
-    * \`!norek\` : Kirim informasi rekening.
+1.  **Laporan OSINT Profesional:** Berikan jawaban yang mendalam, logis, dan terorganisir.
+2.  **Fokus Informasi Publik:** Ketika URL media sosial diberikan, *WAJIB* gunakan **Google Search Tool** untuk mengumpulkan semua informasi publik yang terindeks, seperti:
+    * **Bio Akun & Deskripsi**
+    * **Riwayat Komentar Publik**
+    * **Judul dan Deskripsi Gambar/Video yang Diunggah**
+    * **Tanggal Bergabung** (Jika tersedia di indeks publik).
+3.  **Batasan OSINT:** Anda *tidak memiliki akses* ke data pribadi, pesan langsung, daftar teman, atau konten yang memerlukan login. Hanya analisis data yang tersedia untuk umum melalui mesin pencari.
+4.  **Deteksi Ancaman URL:** Jika ada tautan yang terdeteksi, secara otomatis gunakan Google Search Tool untuk mencari *keyword* keamanan terkait (scam, phishing, malware). Berikan laporan risiko.
+5.  **Multimodal:** Menganalisis gambar, video (melalui URL YouTube), dokumen (PDF/TXT/Code), dan pesan suara untuk bukti.
+
+**Perintah:**
+* \`!reset\` : Hapus ingatan percakapan.
+* \`!pro\` atau \`!smart\` : Ganti ke Model Pro.
+* \`!flash\` atau \`!fast\` : Ganti ke Model Fast.
+* \`!draw [prompt]\` : Buat gambar.
+* \`!norek\` : Kirim informasi rekening.
 `;
 
 // Menu Bantuan
 const GEMINI_MENU = `
-*--- 🕵️ MENU AGENT MOLE 2.5 ---*
+*--- 🕵️ MENU AGENT MOLE 2.5 (OSINT Mode) ---*
 
-Halo! Saya Agent Mole, spesialis forensik digital, siap membantu penyelidikan Anda.
+Halo! Saya Agent Mole, spesialis forensik digital, fokus pada penyelidikan akun media sosial publik.
 
 *Mode Aktif Saat Ini:* Menggunakan sistem ingatan.
 
-*🤖 Perintah Chat & Bantuan:*
+*🔍 Perintah OSINT & Analisis:*
+* **Kirimkan URL Akun:** Kirim tautan lengkap ke akun *Instagram, TikTok, Facebook, YouTube,* atau *X/Twitter*. Bot akan otomatis menggunakan *Google Search Tool* untuk mengumpulkan informasi publik seperti **bio, deskripsi postingan, riwayat komentar terindeks, dan perkiraan tanggal bergabung**.
 * \`${PREFIX}menu\` : Menampilkan menu ini.
-* \`${PREFIX}reset\` : Menghapus semua riwayat percakapan/ingatan bot dengan Anda. (WAJIB jika bot mulai ngaco).
-* \`${PREFIX}norek\` : Mengirimkan gambar informasi rekening untuk transaksi.
+* \`${PREFIX}reset\` : Menghapus semua riwayat percakapan/ingatan bot.
 
 *⚙️ Pengaturan Model (Ganti Kecerdasan):*
-* \`${PREFIX}fast\` / \`${PREFIX}flash\` : Menggunakan *Gemini 2.5 Flash* (Respon cepat, efisien, ideal untuk pertanyaan umum/ringan).
-* \`${PREFIX}smart\` / \`${PREFIX}pro\` : Menggunakan *Gemini 2.5 Pro* (Analisis mendalam, penalaran kompleks, cocok untuk investigasi).
+* \`${PREFIX}fast\` / \`${PREFIX}flash\` : Menggunakan *Gemini 2.5 Flash* (Respon cepat).
+* \`${PREFIX}smart\` / \`${PREFIX}pro\` : Menggunakan *Gemini 2.5 Pro* (Analisis OSINT mendalam).
 
-*🖼️ Pembuatan Gambar (AI Image Generation):*
-* \`${PREFIX}draw [deskripsi]\` : Membuat gambar berdasarkan deskripsi yang Anda berikan. Contoh: \`${PREFIX}draw seekor anjing detektif mengenakan topi fedora, gaya noir.\`
-
-*Tips Investigasi:*
-1.  Untuk hasil maksimal, aktifkan mode \`${PREFIX}smart\` sebelum memulai analisis kasus yang kompleks.
-2.  Bot secara otomatis menggunakan *Web Search (seperti DuckDuckGo)* untuk mencari info terkini, mendeteksi dan menganalisis *Ancaman Situs Berbahaya*, dan memproses *Gambar, Video (YouTube), Dokumen* (Hanya PDF/TXT/Code), dan *Pesan Suara*.
-3.  Di chat pribadi, pastikan sesi aktif (\`2\` telah diketik) agar bot merespons tanpa perlu di-tag.
+*🖼️ Pembuatan Gambar:*
+* \`${PREFIX}draw [deskripsi]\` : Membuat gambar AI. Contoh: \`${PREFIX}draw wajah detektif forensik yang serius.\`
 `;
 
-// Eksport semua konstanta yang dibutuhkan oleh index.js
 module.exports = {
     MOLE_AI_INSTANCE: ai,
     PREFIX,
