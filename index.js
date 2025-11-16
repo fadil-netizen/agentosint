@@ -762,7 +762,7 @@ async function startSock() {
                     if (!PRIVATE_CHAT_STATUS.has(from) && !CHAT_SESSIONS.has(from) && rawText.length > 0 && !rawText.startsWith(PREFIX)) {
                         
                         const welcomeMessage = `
-Halo anda telah menghubungi salah satu Agent(fadil), silahkan tunggu sistem terhubung dengan agent atau.
+Halo anda telah menghubungi salah satu Agent(fadil), silahkan tunggu saya membalas chat atau.
 
     Ketik: \`2\`
     untuk memulai percakapan dengan Agent Mole.
