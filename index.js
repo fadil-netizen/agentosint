@@ -16,62 +16,53 @@ const path = require('path');
 const Jimp = require('jimp'); 
 const jsQR = require('jsqr'); 
 
-// --- KONSTANTA BARU: Batas Ukuran File (Dua Batasan) ---
+// --- KONSTANTA: Batas Ukuran & Delay ---
 const MAX_DOC_SIZE_BYTES = 100 * 1024 * 1024;   // 100 MB untuk Dokumen
 const MAX_MEDIA_SIZE_BYTES = 250 * 1024 * 1024; // 250 MB untuk Gambar & Video
-// ----------------------------------------------------
 
-
-// --- KONSTANTA BARU: Pengaturan Anti-Spam & Delay (Humanisasi) ---
-const ANTI_SPAM_MAP = new Map(); // Map untuk melacak waktu pesan
+const ANTI_SPAM_MAP = new Map(); 
 const SPAM_THRESHOLD = 5;       // Maks 5 pesan dalam 10 detik
 const SPAM_TIME_WINDOW = 10000; // 10 detik
 const RANDOM_DELAY_MIN = 1000;  // 1 detik (Delay minimum mengetik/merespon)
 const RANDOM_DELAY_MAX = 5000;  // 5 detik (Delay maksimum mengetik/merespon)
 const PROCESS_DELAY_MIN = 3000; // 3 detik (Waktu proses AI/Loading)
-const PROCESS_DELAY_MAX = 10000; // Ditingkatkan dari 8 detik menjadi 10 detik
-const API_TIMEOUT_MS = 60000; // Tambahkan timeout API 60 detik (1 menit)
-
-// --- KONSTANTA BARU: Penjadwalan Status ---
+const PROCESS_DELAY_MAX = 10000; // 10 detik
+const API_TIMEOUT_MS = 60000; // Timeout API 60 detik (1 menit)
 const STATUS_REPORT_INTERVAL_MS = 2 * 60 * 1000; // 2 menit
-const TARGET_JID = setting.TARGET_JID; // Diambil dari setting.js
-// ------------------------------------------
+const MAX_RETRIES = 5; // KONFIGURASI RETRY (5x)
 
-// --- KONSTANTA BARU: KONFIGURASI RETRY (5x) ---
-const MAX_RETRIES = 5; 
-// --------------------------------------------------------------------
+// --- KONSTANTA DARI SETTING.JS ---
+const ai = setting.MOLE_AI_INSTANCE; 
+const PREFIX = setting.PREFIX;
+const CHAT_SESSIONS = setting.CHAT_SESSIONS; 
+const GEMINI_MODEL_MAP = setting.GEMINI_MODEL_MAP;
+const MODELS = setting.MODELS;
+const SMART_MODE_SYSTEM_INSTRUCTION = setting.SMART_MODE_SYSTEM_INSTRUCTION; 
+const GOOGLE_SEARCH_CONFIG = setting.GOOGLE_SEARCH_CONFIG; 
+const PRIVATE_CHAT_STATUS = setting.PRIVATE_CHAT_STATUS; 
+const TARGET_JID = setting.TARGET_JID; 
+// ------------------------------------
 
 
-// --- FUNGSI BARU: Jeda Acak (Mempersonalisasi Waktu Respon) ---
+// --- FUNGSI HELPER UMUM ---
+
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// --- FUNGSI BARU: Cek Anti-Spam ---
 function checkAntiSpam(jid) {
     const now = Date.now();
     const history = ANTI_SPAM_MAP.get(jid) || [];
-
-    // Filter pesan yang masih dalam window waktu
     const recentMessages = history.filter(time => now - time < SPAM_TIME_WINDOW);
-
     recentMessages.push(now);
-
-    // Hapus pesan paling lama jika melebihi batas (agar map tidak membesar)
     while (recentMessages.length > SPAM_THRESHOLD) {
         recentMessages.shift();
     }
-
     ANTI_SPAM_MAP.set(jid, recentMessages);
-
-    // Cek apakah jumlah pesan melebihi threshold
     return recentMessages.length > SPAM_THRESHOLD;
 }
-// ----------------------------------------------------
 
-// --- FUNGSI BARU: Kirim Laporan Status ke Nomor Tertentu ---
 async function sendStatusReport(sock, targetJid) {
-    // Hanya kirim jika koneksi sudah 'open' dan bot sudah memiliki user info
     if (sock.user && sock.ws.isOpen) {
         console.log(`[STATUS REPORT] Mengirim laporan status ke ${targetJid}`);
         const now = new Date();
@@ -105,32 +96,71 @@ Bot Aktif dan Terhubung ke WhatsApp.
         console.log("[STATUS REPORT SKIP] Koneksi belum siap atau bot belum login.");
     }
 }
-// ----------------------------------------------------
 
+// --- FUNGSI HELPER MULTIMODAL & OSINT ---
 
-const ai = setting.MOLE_AI_INSTANCE; 
-const PREFIX = setting.PREFIX;
-const CHAT_SESSIONS = setting.CHAT_SESSIONS; 
-const GEMINI_MODEL_MAP = setting.GEMINI_MODEL_MAP;
-const MODELS = setting.MODELS;
-const SMART_MODE_SYSTEM_INSTRUCTION = setting.SMART_MODE_SYSTEM_INSTRUCTION; 
-const GOOGLE_SEARCH_CONFIG = setting.GOOGLE_SEARCH_CONFIG; 
-const PRIVATE_CHAT_STATUS = setting.PRIVATE_CHAT_STATUS; 
+function bufferToGenerativePart(buffer, mimeType) {
+    if (!buffer || buffer.length === 0) {
+        return null;
+    }
+    return {
+        inlineData: {
+            data: buffer.toString("base64"),
+            mimeType
+        },
+    };
+}
 
+function uriToGenerativePart(uri, mimeType) {
+    return {
+        fileData: {
+            fileUri: uri,
+            mimeType: mimeType 
+        },
+    };
+}
 
-// --- FUNGSI BARU: EKSTRAKSI URL UMUM (UNTUK DETEKSI ANCAMAN) ---
+// Fungsi Helper Baru untuk Deteksi URL YouTube 
+function extractYoutubeUrl(text) {
+    const youtubeRegex = /(?:https?:\/\/)?(?:www\.)?(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})(?:\S+)?/i;
+    const match = text.match(youtubeRegex);
+    return match ? match[0] : null;
+}
+
+// Fungsi Helper Baru untuk Deteksi URL Instagram 
+function extractInstagramUrl(text) {
+    const instagramRegex = /(?:https?:\/\/)?(?:www\.)?(?:instagram\.com)\/([\w\-\.]+)(?:\/)?(?:p|reel|tv)?\/?([\w\-\.]*)?(\/)?/i;
+    const match = text.match(instagramRegex);
+    return match ? match[0] : null; 
+}
+
+// FUNGSI BARU: Deteksi URL X/Twitter, Facebook, TikTok
+function extractSocialMediaUrl(text) {
+    const socialMediaRegex = /(?:https?:\/\/(?:www\.)?)(?:twitter\.com|x\.com|facebook\.com|fb\.watch|tiktok\.com)\/([\w\-\.\/]+)/i;
+    const match = text.match(socialMediaRegex);
+    return match ? match[0] : null; 
+}
+
+// FUNGSI BARU: Deteksi ID Telegram/WhatsApp
+function extractMessagingInfo(text) {
+    const telegramRegex = /(?:t\.me\/[\w\-\.]+)|(?:\@[\w\-\.]+)/i;
+    const whatsappRegex = /(?:wa\.me\/\d+)|(?:chat\.whatsapp.com\/[\w\d]+)/i;
+    let info = { telegram: null, whatsapp: null };
+    const telegramMatch = text.match(telegramRegex);
+    if (telegramMatch) { info.telegram = telegramMatch[0]; }
+    const whatsappMatch = text.match(whatsappRegex);
+    if (whatsappMatch) { info.whatsapp = whatsappMatch[0]; }
+    return info.telegram || info.whatsapp ? info : null;
+}
+
 function extractDangerousUrl(text) {
     // Regex yang mendeteksi http/https URL, mengabaikan wa.me/chat.whatsapp.com yang umumnya aman.
     const urlRegex = /(https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|www\.[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9]+\.[^\s]{2,}|www\.[a-zA-Z0-9]+\.[^\s]{2,})/gi;
-    
-    // Filter untuk mengabaikan tautan WhatsApp/YouTube/Social Media yang sudah ditangani secara spesifik
     const safeDomains = /youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com|facebook\.com|fb\.watch|tiktok\.com|t\.me|wa\.me|chat\.whatsapp\.com/i;
-
     const matches = text.match(urlRegex) || [];
     const uniqueUrls = new Set();
     
     matches.forEach(url => {
-        // Hanya tambahkan jika tidak termasuk domain yang sudah ditangani/dianggap relatif "aman"
         if (!safeDomains.test(url)) {
             uniqueUrls.add(url);
         }
@@ -138,10 +168,15 @@ function extractDangerousUrl(text) {
 
     return Array.from(uniqueUrls);
 }
-// ----------------------------------------------------
 
+function highlightTimestamps(text) {
+    const timestampRegex = /(\b\d{1,2}:\d{2}(:\d{2})?\b)|(\(\d{1,2}:\d{2}(:\d{2})?\))|(\[\d{1,2}:\d{2}(:\d{2})?\])/g;
+    return text.replace(timestampRegex, (match) => {
+        const cleanMatch = match.replace(/[\(\)\[\]]/g, '');
+        return `*⏱️ \`${cleanMatch}\`*`; 
+    });
+}
 
-// --- FUNGSI BARU UNTUK DECODE QR CODE ---
 async function decodeQrCode(buffer) {
     try {
         const image = await Jimp.read(buffer);
@@ -150,20 +185,152 @@ async function decodeQrCode(buffer) {
             image.bitmap.width,
             image.bitmap.height
         );
-
         if (qrCode) {
             return qrCode.data;
         } else {
             return null; 
         }
     } catch (error) {
-        // console.error("Gagal mendecode QR Code, mungkin bukan QR Code:", error.message); 
-        return null; // Return null jika gagal decode (error Jimp/jsQR)
+        return null; 
     }
 }
 
+async function extractTextFromDocument(buffer, mimeType) {
+    if (mimeType === 'application/pdf' || mimeType === 'text/plain' || mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/javascript') {
+        return null; 
+    }
+    return `*Dokumen Tipe Tidak Dikenal:* ${mimeType}`; 
+}
 
-// --- FUNGSI BARU UNTUK MENGIRIM GAMBAR COMMAND (/norek) ---
+// --- FUNGSI BAILYS & GEMINI CORE ---
+
+// FUNGSI INI TELAH DIMODIFIKASI (ASYNC + LOGIKA INGATAN 8 CHAT)
+async function getOrCreateChat(jid, forceModel = null) {
+    const selectedModel = forceModel || GEMINI_MODEL_MAP.get(jid) || MODELS.DEFAULT;
+    
+    // 💡 Batas ingatan yang Anda minta
+    const HISTORY_LIMIT = 8; 
+    let prunedHistory = [];
+
+    if (!forceModel && CHAT_SESSIONS.has(jid)) {
+        const chatInstance = CHAT_SESSIONS.get(jid);
+        
+        if (chatInstance.model === selectedModel) {
+            // --- LOGIKA INGATAN & OPTIMASI RAM ---
+            // Ambil riwayat penuh dari sesi yang ada
+            const fullHistory = await chatInstance.getHistory();
+            
+            // Filter HANYA untuk pesan teks. Ini PENTING untuk menghemat RAM.
+            const textOnlyHistory = fullHistory.filter(msg => {
+                 // Pastikan semua bagian dari pesan adalah teks (bukan inlineData/media)
+                return msg.parts.every(part => part.text !== undefined);
+            });
+
+            // Ambil 8 pesan teks terakhir
+            prunedHistory = textOnlyHistory.slice(-HISTORY_LIMIT);
+            
+            // Hapus sesi lama (kita akan buat baru dengan ingatan yang dipangkas)
+            CHAT_SESSIONS.delete(jid);
+            
+        } else {
+             // Model diganti, hapus sesi lama
+             CHAT_SESSIONS.delete(jid);
+        }
+    } else if (forceModel && CHAT_SESSIONS.has(jid)) {
+        CHAT_SESSIONS.delete(jid);
+    }
+    
+    // Jika ada riwayat yang dipangkas, siapkan untuk diinjeksi
+    let historyInjection = {};
+    if (prunedHistory.length > 0) {
+        historyInjection = { history: prunedHistory };
+    }
+
+    let chatConfig = {
+        config: {
+            // 💡 Google Search Tool AKTIF
+            tools: setting.GOOGLE_SEARCH_CONFIG.apiKey && setting.GOOGLE_SEARCH_CONFIG.cx ? [{ googleSearch: setting.GOOGLE_SEARCH_CONFIG }] : [], 
+            // SMART Mode System Instruction diambil dari setting.js
+            ...(selectedModel === MODELS.SMART && { systemInstruction: SMART_MODE_SYSTEM_INSTRUCTION }),
+             // Set Timeout untuk API Call
+            timeout: API_TIMEOUT_MS,
+        }
+    };
+    
+    // 💡 Injeksi System Instruction Minimal untuk Fast Mode
+    if (selectedModel === MODELS.FAST) {
+         chatConfig.config.systemInstruction = 'Anda adalah model bahasa besar yang digunakan untuk mencari kasus kriminal. Nama Anda adalah Agent Mole.';
+    }
+
+    // Buat chat baru dengan ingatan yang sudah dioptimalkan (prunedHistory)
+    const chat = ai.chats.create({ 
+        model: selectedModel, 
+        ...chatConfig,
+        ...historyInjection // 💡 Injeksi ingatan 8 chat terakhir (jika ada)
+    });
+    
+    chat.model = selectedModel; 
+    CHAT_SESSIONS.set(jid, chat);
+    
+    console.log(`[MEMORY] Sesi dibuat/diperbarui untuk ${jid}. ${prunedHistory.length}/${HISTORY_LIMIT} pesan teks dimuat.`);
+    return chat;
+}
+
+
+function isBotMentioned(m, sock) {
+    if (!sock.user || !m.key.remoteJid.endsWith('@g.us')) return false; 
+
+    const botJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+    const botJidRaw = sock.user.id.split(':')[0];
+
+    const contextInfo = m.message?.extendedTextMessage?.contextInfo;
+    const messageText = extractMessageText(m); 
+
+    const mentionedJids = contextInfo?.mentionedJid || [];
+    
+    return mentionedJids.includes(botJid) || 
+           contextInfo?.participant === botJid || 
+           messageText.includes('@' + botJidRaw);
+}
+
+function extractMessageText(m) {
+    let text = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+    
+    if (!text) {
+        text = m.message?.imageMessage?.caption || m.message?.videoMessage?.caption || m.message?.documentMessage?.caption || '';
+    }
+    
+    if (!text && m.message?.ephemeralMessage) {
+        const ephemeralMsg = m.message.ephemeralMessage.message;
+        text = ephemeralMsg?.conversation || 
+               ephemeralMsg?.extendedTextMessage?.text ||
+               ephemeralMsg?.imageMessage?.caption ||
+               ephemeralMsg?.videoMessage?.caption ||
+               ephemeralMsg?.documentMessage?.caption ||
+               '';
+    }
+    
+    if (m.message?.viewOnceMessage) {
+        const viewMsg = m.message.viewOnceMessage.message;
+        text = viewMsg?.imageMessage?.caption || 
+               viewMsg?.videoMessage?.caption || 
+               viewMsg?.extendedTextMessage?.text || 
+               viewMsg?.documentMessage?.caption || 
+               text; 
+    }
+
+    const quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage || 
+                   m.message?.imageMessage?.contextInfo?.quotedMessage ||
+                   m.message?.videoMessage?.contextInfo?.quotedMessage ||
+                   m.message?.documentMessage?.contextInfo?.quotedMessage;
+    
+    if (!text && quoted) {
+        text = quoted.conversation || quoted.extendedTextMessage?.text || quoted.imageMessage?.caption || quoted.videoMessage?.caption || quoted.documentMessage?.caption || '';
+    }
+
+    return text.trim();
+}
+
 async function handleSendImageCommand(sock, from, imagePath, caption) {
     try {
         // 🛡️ Humanisasi: Mulai status composing (mengetik)
@@ -194,224 +361,6 @@ async function handleSendImageCommand(sock, from, imagePath, caption) {
 }
 
 
-// --- Fungsi Helper untuk Multimodal (Gambar, Video & Dokumen) - INLINE ---
-function bufferToGenerativePart(buffer, mimeType) {
-    if (!buffer || buffer.length === 0) {
-        return null;
-    }
-    return {
-        inlineData: {
-            data: buffer.toString("base64"),
-            mimeType
-        },
-    };
-}
-
-
-// --- Fungsi Helper untuk Multimodal (Gambar, Video & Dokumen) - URI (YouTube) ---
-function uriToGenerativePart(uri, mimeType) {
-    return {
-        fileData: {
-            fileUri: uri,
-            mimeType: mimeType 
-        },
-    };
-}
-
-
-// --- Fungsi Helper Baru untuk Deteksi URL YouTube ---
-function extractYoutubeUrl(text) {
-    const youtubeRegex = /(?:https?:\/\/)?(?:www\.)?(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})(?:\S+)?/i;
-    const match = text.match(youtubeRegex);
-    
-    if (match && match[0]) {
-        return match[0]; 
-    }
-    return null;
-}
-
-
-// --- Fungsi Helper Baru untuk Deteksi URL Instagram ---
-function extractInstagramUrl(text) {
-    // Regex untuk mendeteksi URL Instagram (post, profile, reel)
-    const instagramRegex = /(?:https?:\/\/)?(?:www\.)?(?:instagram\.com)\/([\w\-\.]+)(?:\/)?(?:p|reel|tv)?\/?([\w\-\.]*)?(\/)?/i;
-    const match = text.match(instagramRegex);
-    
-    // Kita hanya mengambil URL yang lengkap untuk analisis
-    return match ? match[0] : null; 
-}
-// ----------------------------------------------------
-
-// --- FUNGSI BARU: Deteksi URL X/Twitter, Facebook, TikTok ---
-function extractSocialMediaUrl(text) {
-    // Regex yang mencakup X/Twitter, Facebook, dan TikTok
-    const socialMediaRegex = /(?:https?:\/\/(?:www\.)?)(?:twitter\.com|x\.com|facebook\.com|fb\.watch|tiktok\.com)\/([\w\-\.\/]+)/i;
-    const match = text.match(socialMediaRegex);
-    return match ? match[0] : null; 
-}
-
-// --- FUNGSI BARU: Deteksi ID Telegram/WhatsApp ---
-function extractMessagingInfo(text) {
-    // Mencari pattern username Telegram (@user) atau format link invite (t.me/joinchat)
-    const telegramRegex = /(?:t\.me\/[\w\-\.]+)|(?:\@[\w\-\.]+)/i;
-    // Mencari pattern link WhatsApp (wa.me/nomor) atau grup invite
-    const whatsappRegex = /(?:wa\.me\/\d+)|(?:chat\.whatsapp.com\/[\w\d]+)/i;
-
-    let info = { telegram: null, whatsapp: null };
-    
-    const telegramMatch = text.match(telegramRegex);
-    if (telegramMatch) { info.telegram = telegramMatch[0]; }
-
-    const whatsappMatch = text.match(whatsappRegex);
-    if (whatsappMatch) { info.whatsapp = whatsappMatch[0]; }
-    
-    // Hanya kembalikan jika ada salah satu yang terdeteksi
-    return info.telegram || info.whatsapp ? info : null;
-}
-// ----------------------------------------------------
-
-
-/**
- * Fungsi untuk menyorot pola waktu (timestamp) di dalam teks.
- */
-function highlightTimestamps(text) {
-    const timestampRegex = /(\b\d{1,2}:\d{2}(:\d{2})?\b)|(\(\d{1,2}:\d{2}(:\d{2})?\))|(\[\d{1,2}:\d{2}(:\d{2})?\])/g;
-
-    return text.replace(timestampRegex, (match) => {
-        const cleanMatch = match.replace(/[\(\)\[\]]/g, '');
-        return `*⏱️ \`${cleanMatch}\`*`; 
-    });
-}
-
-
-// --- Fungsi Helper Ekstraksi Dokumen (Dibatasi ke PDF/Teks) ---
-async function extractTextFromDocument(buffer, mimeType) {
-    // Hanya izinkan PDF dan tipe teks/kode yang didukung native oleh Gemini.
-    if (mimeType === 'application/pdf' || mimeType === 'text/plain' || mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/javascript') {
-        return null; // Null berarti kirim buffer langsung ke Gemini API (native support)
-    }
-    
-    // Mengembalikan string jika tipe file tidak didukung
-    return `*Dokumen Tipe Tidak Dikenal:* ${mimeType}`; 
-}
-
-
-// --- Fungsi Helper untuk Sesi Chat (Ingatan Otomatis & Tools) ---
-function getOrCreateChat(jid, forceModel = null) {
-    const selectedModel = forceModel || GEMINI_MODEL_MAP.get(jid) || MODELS.DEFAULT;
-    
-    // Jika tidak dipaksa modelnya, cek apakah sesi yang ada sudah menggunakan model yang benar
-    if (!forceModel && CHAT_SESSIONS.has(jid)) {
-        const chatInstance = CHAT_SESSIONS.get(jid);
-        if (chatInstance.model !== selectedModel) {
-            CHAT_SESSIONS.delete(jid); 
-        } else {
-             return chatInstance;
-        }
-    }
-    
-    // Jika dipaksa (untuk failover), hapus sesi lama untuk membuat yang baru dengan model berbeda
-    if (forceModel && CHAT_SESSIONS.has(jid)) {
-        CHAT_SESSIONS.delete(jid);
-    }
-
-
-    let chatConfig = {
-        config: {
-            // 💡 Google Search Tool AKTIF
-            tools: setting.GOOGLE_SEARCH_CONFIG.apiKey && setting.GOOGLE_SEARCH_CONFIG.cx ? [{ googleSearch: setting.GOOGLE_SEARCH_CONFIG }] : [], 
-            // SMART Mode System Instruction diambil dari setting.js
-            ...(selectedModel === MODELS.SMART && { systemInstruction: SMART_MODE_SYSTEM_INSTRUCTION }),
-             // Set Timeout untuk API Call
-            timeout: API_TIMEOUT_MS,
-        }
-    };
-    
-    // 💡 Injeksi System Instruction Minimal untuk Fast Mode
-    if (selectedModel === MODELS.FAST) {
-         // Instruksi sederhana agar model Fast Mode (Flash) merespons sebagai Agent Mole
-         chatConfig.config.systemInstruction = 'Anda adalah model bahasa besar yang digunakan untuk mencari kasus kriminal. Nama Anda adalah Agent Mole.';
-    }
-
-    const chat = ai.chats.create({ model: selectedModel, ...chatConfig });
-    chat.model = selectedModel; 
-    CHAT_SESSIONS.set(jid, chat);
-    return chat;
-}
-
-// --- FUNGSI HELPER UNTUK CEK MENTION (FINAL) ---
-function isBotMentioned(m, sock) {
-    if (!sock.user) return false; 
-    
-    // HANYA cek mention di group
-    if (!m.key.remoteJid.endsWith('@g.us')) return false; 
-
-    const botJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-    const botJidRaw = sock.user.id.split(':')[0];
-
-    const contextInfo = m.message?.extendedTextMessage?.contextInfo;
-    
-    // Gunakan fungsi yang lebih robust untuk mendapatkan teks
-    const messageText = extractMessageText(m); 
-
-    const mentionedJids = contextInfo?.mentionedJid || [];
-    
-    // Bot ter-mention jika JID ada di daftar mention, di-reply, atau JID raw ada di teks
-    return mentionedJids.includes(botJid) || 
-           contextInfo?.participant === botJid || 
-           messageText.includes('@' + botJidRaw);
-}
-
-// --- FUNGSI BARU: EKSTRAKSI PESAN LEBIH ROBUST ---
-function extractMessageText(m) {
-    // Cek pesan reguler atau pesan yang diperpanjang (extended)
-    let text = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
-    
-    // Cek caption untuk media (Image, Video, Document)
-    if (!text) {
-        text = m.message?.imageMessage?.caption || m.message?.videoMessage?.caption || m.message?.documentMessage?.caption || '';
-    }
-    
-    // Cek Ephemeral Message (Pesan yang hilang)
-    if (!text && m.message?.ephemeralMessage) {
-        const ephemeralMsg = m.message.ephemeralMessage.message;
-        text = ephemeralMsg?.conversation || 
-               ephemeralMsg?.extendedTextMessage?.text ||
-               ephemeralMsg?.imageMessage?.caption ||
-               ephemeralMsg?.videoMessage?.caption ||
-               ephemeralMsg?.documentMessage?.caption ||
-               '';
-    }
-    
-    // --- PERBAIKAN AKHIR: Menambahkan cek ViewOnceMessage (sering dikirim dari Mobile) ---
-    if (m.message?.viewOnceMessage) {
-        const viewMsg = m.message.viewOnceMessage.message;
-        text = viewMsg?.imageMessage?.caption || 
-               viewMsg?.videoMessage?.caption || 
-               viewMsg?.extendedTextMessage?.text || 
-               viewMsg?.documentMessage?.caption || 
-               text; // Fallback ke teks yang sudah ada
-    }
-    // ---------------------------------------------------------------------------------
-
-    // Cek Quoted Message (Pesan Balasan) - Seringkali masalah di Mobile
-    const quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage || 
-                   m.message?.imageMessage?.contextInfo?.quotedMessage ||
-                   m.message?.videoMessage?.contextInfo?.quotedMessage ||
-                   m.message?.documentMessage?.contextInfo?.quotedMessage;
-    
-    // Khusus balasan, kita cek teks dari pesan yang dibalas
-    // CATATAN: Kami hanya mengambil QUOTED MESSAGE TEXT jika messageText saat ini kosong
-    if (!text && quoted) {
-        text = quoted.conversation || quoted.extendedTextMessage?.text || quoted.imageMessage?.caption || quoted.videoMessage?.caption || quoted.documentMessage?.caption || '';
-    }
-
-    return text.trim();
-}
-// --- AKHIR FUNGSI BARU ---
-
-
-// --- Fungsi Utama untuk Berbicara dengan Agent Mole (Ingatan Aktif dan Multimodal) ---
 async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFailover = false) {
     let response = null;
     let lastError = null;
@@ -435,7 +384,8 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFai
         });
 
         // Hapus sesi saat ini untuk membuat sesi baru dengan model yang benar (penting untuk failover)
-        const chat = getOrCreateChat(from, initialModel);
+        // MODIFIKASI: Tambahkan 'await'
+        const chat = await getOrCreateChat(from, initialModel);
         const currentModel = chat.model;
 
         let contents = [...mediaParts];
@@ -457,7 +407,7 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFai
             threatInstruction = (
                 `*⚠️ DETEKSI ANCAMAN URL:* Tautan potensial berbahaya terdeteksi: ${urlList}. ` +
                 `*PRIORITAS*: Gunakan Tool Google Search (Web Search) untuk melakukan analisis keamanan pada setiap URL ini. Cari bukti terkait *scam*, *phishing*, *malware*, atau laporan negatif lainnya. ` +
-                `Sertakan laporan risiko keamanan yang komprehensif sebagai bagian dari jawaban Anda.`
+                `Sertakan laporan analisis risiko yang jelas dan informatif.`
             );
         }
         // ----------------------------------------------------
@@ -480,7 +430,7 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFai
              if (isAudio) {
                  finalQuery = 
                     `${serverTime}\n\n${roleInjection}*Permintaan Audio:*\n` +
-                    'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal (misalnya: berita, harga, cuaca), *Gunakan Tool Google Search (Web Search)* untuk mendapatkan jawaban yang akurat. ' +
+                    'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal, *Gunakan Tool Google Search (Web Search)* untuk mendapatkan jawaban yang akurat. ' +
                     'Setelah itu, balaslah isi pesan tersebut dengan jawaban yang relevan dan personal. Di akhir jawaban Anda, berikan juga transkripsi dan ringkasan Voice Note sebagai referensi.';
 
              } else {
@@ -489,7 +439,7 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFai
              contents.push(finalQuery);
         } else {
              finalQuery = 
-                `${serverTime}\n\n*Pesan Default:*\nHalo! Saya Agent Mole, siap membantu analisis kasus Anda. Anda bisa mengajukan pertanyaan, mengirim gambar, video, dokumen (PDF/TXT/Code), atau *voice note* setelah me-*tag* saya. Ketik ${PREFIX}menu untuk melihat daftar perintah.`;
+                `${serverTime}\n\n*Pesan Default:*\nHalo! Saya Agent Mole, siap membantu analisis kasus Anda. Anda bisa mengajukan pertanyaan, kirim media, atau URL setelah me-*tag* saya. Ketik ${PREFIX}menu untuk melihat daftar perintah.`;
              contents.push(finalQuery);
         }
         
@@ -581,32 +531,11 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFai
 
         await sock.sendMessage(from, { text: finalResponse });
         
-        // --- OPTIMASI EFISIENSI MEMORI ---
-        // Jika mode bukan failover, perbarui status model pengguna
-        if (!isFailover) {
-            if (hasMedia) {
-                 const history = await chat.getHistory();
-                 CHAT_SESSIONS.delete(from);
-                 const newChat = getOrCreateChat(from);
-                 
-                 const textOnlyHistory = history.filter(msg => {
-                     return typeof msg.parts[0] === 'string' || (msg.parts.length === 1 && typeof msg.parts[0].text === 'string');
-                 });
-                 
-                 const smallTextHistory = textOnlyHistory.slice(-3);
-                 newChat.history = smallTextHistory;
-                 
-                 console.log(`[OPTIMASI MEMORI] Sesi dengan media dihapus. Sesi baru dibuat dengan ${smallTextHistory.length} riwayat teks.`);
-            }
-        } else {
-             // Jika failover berhasil, sesi Fast Mode tetap ada, dan kita HANYA perlu menghapus histori jika ada media
-             if (hasMedia) {
-                 CHAT_SESSIONS.delete(from);
-                 getOrCreateChat(from, MODELS.FAST); // Buat ulang sesi fast mode tanpa history media
-             }
-             // *PENTING*: Jangan ubah GEMINI_MODEL_MAP pengguna; biarkan mereka tetap di SMART mode untuk permintaan berikutnya.
-        }
-        // ------------------------------------------------------------------
+        // --- MODIFIKASI: BLOK OPTIMASI MEMORI DIHAPUS ---
+        // Logika optimasi memori (menghapus media) sekarang sudah ditangani
+        // di awal fungsi getOrCreateChat() pada pemanggilan berikutnya.
+        // Tidak ada kode yang perlu dihapus secara eksplisit di sini karena 
+        // getOrCreateChat() yang baru sudah mengelolanya.
 
     } catch (error) {
         console.error("-----------------------------------------------------");
@@ -636,28 +565,21 @@ async function handleGeminiRequest(sock, from, textQuery, mediaParts = [], isFai
 }
 
 
-// --- Fungsi Khusus untuk Image Generation ---
 async function handleImageGeneration(sock, from, prompt) {
     let response = null;
     let lastError = null;
 
     try {
         await sock.sendPresenceUpdate('composing', from); 
-
         const model = MODELS.IMAGE_GEN; 
-
         console.log(`[AGENT MOLE DRAW] Menerima permintaan: "${prompt}"`); 
         
-        // --- LOGIKA RETRY DITERAPKAN DI SINI ---
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
                 console.log(`[AGENT MOLE DRAW] Mengirim permintaan. Percobaan ke-${attempt}/${MAX_RETRIES}`); 
-
-                // Jeda Proses AI sebelum pemanggilan API
                 const processDelay = Math.floor(Math.random() * (PROCESS_DELAY_MAX - PROCESS_DELAY_MIN + 1)) + PROCESS_DELAY_MIN;
                 await sleep(processDelay);
                 
-                // Tambahkan config timeout 
                 const imageConfig = {
                     model: model,
                     contents: [prompt],
@@ -667,17 +589,13 @@ async function handleImageGeneration(sock, from, prompt) {
                 };
 
                 response = await ai.models.generateContent(imageConfig);
-                
                 console.log(`[AGENT MOLE DRAW] Respons diterima pada percobaan ke-${attempt}.`); 
-                break; // Keluar dari loop jika berhasil
+                break; 
             } catch (error) {
                 lastError = error;
-
-                // Cek error 503 atau pesan yang mengindikasikan server overload/timeout
                 const isRetryableError = error.status === 503 || error.message.includes('503') || error.message.includes('overloaded') || error.message.includes('UNAVAILABLE') || error.message.includes('timeout');
 
                 if (attempt < MAX_RETRIES && isRetryableError) {
-                    // Exponential Backoff dengan Jitter: 2^n * 1000ms + random(1000ms)
                     const delayTime = Math.pow(2, attempt) * 1500 + Math.random() * 2000; 
                     console.warn(`[RETRY WARNING DRAW] Percobaan ke-${attempt} gagal (Status ${error.status || 'Unknown'}). Mencoba lagi dalam ${Math.round(delayTime / 1000)} detik.`);
                     await sleep(delayTime);
@@ -685,7 +603,6 @@ async function handleImageGeneration(sock, from, prompt) {
                     console.error(`[FATAL ERROR 503 DRAW] Semua ${MAX_RETRIES} percobaan gagal.`, error.message);
                     throw new Error("Model gambar terlalu sibuk (503). Mohon coba lagi nanti.");
                 } else {
-                    // Error non-retryable
                     throw error;
                 }
             }
@@ -701,8 +618,6 @@ async function handleImageGeneration(sock, from, prompt) {
         
         if (imagePart) {
             const imageBuffer = Buffer.from(imagePart.inlineData.data, 'base64');
-            
-            // 🛡️ Humanisasi: Jeda sebelum mengirim pesan gambar (typing)
             await sock.sendPresenceUpdate('composing', from); 
             const typingDelay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
             await sleep(typingDelay); 
@@ -713,7 +628,6 @@ async function handleImageGeneration(sock, from, prompt) {
             });
 
         } else {
-            // 🛡️ Humanisasi: Jeda sebelum mengirim pesan error (typing)
             await sock.sendPresenceUpdate('composing', from);
             const typingDelay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
             await sleep(typingDelay); 
@@ -732,7 +646,6 @@ async function handleImageGeneration(sock, from, prompt) {
              errorDetail = "Server AI Image Generator sedang kelebihan beban. Kami sudah mencoba 5x. Mohon tunggu 5-10 menit dan coba lagi.";
         }
         
-        // 🛡️ Humanisasi: Jeda sebelum kirim pesan error (typing)
         await sock.sendPresenceUpdate('composing', from);
         const typingDelay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
         await sleep(typingDelay);
@@ -745,18 +658,13 @@ async function handleImageGeneration(sock, from, prompt) {
     }
 }
 
-
-// --- Fungsi Pengelolaan Perintah ---
 async function resetUserMemory(sock, jid) {
     CHAT_SESSIONS.delete(jid);
-    
-    // 🛡️ Humanisasi: Kirim status typing dan jeda
     await sock.sendPresenceUpdate('composing', jid);
     const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
     await sleep(delay); 
-    
     await sock.sendMessage(jid, { text: '*✅ Semua ingatan riwayat percakapan Anda telah dihapus*. Ingatan telah dimatikan.' });
-    await sock.sendPresenceUpdate('available', jid); // PENTING: Kembalikan status
+    await sock.sendPresenceUpdate('available', jid); 
 }
 
 
@@ -767,33 +675,29 @@ async function changeModel(sock, jid, modelKey) {
     GEMINI_MODEL_MAP.set(jid, newModel);
     CHAT_SESSIONS.delete(jid); 
 
-    // 🛡️ Humanisasi: Kirim status typing dan jeda
     await sock.sendPresenceUpdate('composing', jid);
     const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
     await sleep(delay); 
 
     await sock.sendMessage(jid, { text: `✅ Mode telah diganti menjadi *${newModelName}* (\`${newModel}\`). Ingatan baru akan dimulai.` });
-    await sock.sendPresenceUpdate('available', jid); // PENTING: Kembalikan status
+    await sock.sendPresenceUpdate('available', jid); 
 }
 
 
-// Fungsi utama untuk menjalankan bot
+// --- FUNGSI UTAMA START BOT ---
 async function startSock() {
     try {
-        // --- FOKUS UTAMA: useMultiFileAuthState('baileys_auth_info') ---
-        // Jika folder 'baileys_auth_info' tidak ada, Baileys akan memulai sesi baru.
         const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info'); 
         
         const sock = makeWASocket({
             auth: state,
-            printQRInTerminal: false, // Disetel false karena kita tangani QR di event listener
+            printQRInTerminal: false, 
         });
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                // ✅ LOGIKA QR CODE BARU: Dipanggil jika tidak ada sesi tersimpan
                 qrcode.generate(qr, { small: true });
                 console.log("Scan QR code ini dengan WhatsApp kamu!");
             }
@@ -805,21 +709,15 @@ async function startSock() {
 
                 if (shouldReconnect) {
                     console.log('Koneksi tertutup, mencoba menyambung ulang secara otomatis...');
-                    // Jeda sebentar sebelum mencoba menyambung ulang
                     setTimeout(() => startSock(), 3000); 
                 } else {
-                    console.log('Koneksi ditutup. Anda telah logout (Sesi dihapus).');
-                    // ⚠️ CATATAN PENTING: Jika terjadi DisconnectReason.loggedOut, 
-                    // Anda harus HAPUS folder 'baileys_auth_info' secara manual sebelum menjalankan bot lagi.
+                    console.log('Koneksi ditutup. Anda telah logout.');
                 }
             } else if (connection === 'open') {
                 console.log('Bot siap digunakan! Agent Mole Aktif.');
                 
-                // 💡 LOGIKA PENJADWALAN STATUS AKTIF DI SINI
-                // Kirim laporan status pertama kali saat koneksi terbuka
+                // Jadwalkan laporan status berulang 
                 sendStatusReport(sock, TARGET_JID); 
-                
-                // Jadwalkan laporan status berulang setiap 2 menit (STATUS_REPORT_INTERVAL_MS)
                 setInterval(() => {
                     sendStatusReport(sock, TARGET_JID);
                 }, STATUS_REPORT_INTERVAL_MS);
@@ -828,7 +726,7 @@ async function startSock() {
 
         sock.ev.on('creds.update', saveCreds);
 
-        // Event listener untuk pesan masuk DIBUNGKUS DENGAN TRY-CATCH UNTUK STABILITAS
+        // Event listener untuk pesan masuk
         sock.ev.on('messages.upsert', async ({ messages }) => {
             try {
                 const m = messages[0];
@@ -839,36 +737,28 @@ async function startSock() {
 
                 // 🛡️ STRATEGI ANTI-SPAM: Cek dan abaikan jika melebihi batas
                 if (checkAntiSpam(from)) {
-                    // Hanya di chat pribadi, beri peringatan sekali, lalu diam.
                     if (!isGroup && ANTI_SPAM_MAP.get(from).length === SPAM_THRESHOLD + 1) {
-                         // 🛡️ Humanisasi: Jeda sebelum kirim peringatan
                         await sock.sendPresenceUpdate('composing', from);
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay);
-                        
-                        // Kirim peringatan hanya sekali saat batas dilanggar
                         await sock.sendMessage(from, { text: "⚠️ *Peringatan Anti-Spam*: Anda mengirim terlalu banyak pesan dalam waktu singkat. Mohon tunggu sebentar sebelum mengirim lagi." });
                     }
                     console.log(`[ANTI-SPAM] Mengabaikan pesan dari JID: ${from}`);
                     await sock.sendPresenceUpdate('available', from);
                     return; 
                 }
-                // ---------------------------------------------------------
                 
                 const messageType = Object.keys(m.message)[0];
-                // --- AMBIL TEKS MENGGUNAKAN FUNGSI ROBUST ---
                 let messageText = extractMessageText(m); 
-                // ------------------------------------------
                 
                 const command = messageText.toLowerCase().split(' ')[0];
                 const args = messageText.slice(command.length).trim();
-                const rawText = messageText.trim(); // Untuk pengecekan 1/2
+                const rawText = messageText.trim(); 
 
                 // --- LOGIKA PESAN SELAMAT DATANG / SESSION LOCK (Pribadi) ---
                 if (!isGroup) {
                     const currentStatus = PRIVATE_CHAT_STATUS.get(from);
                     
-                    // Logika Sambutan Pertama Kali
                     if (!PRIVATE_CHAT_STATUS.has(from) && !CHAT_SESSIONS.has(from) && rawText.length > 0 && !rawText.startsWith(PREFIX)) {
                         
                         const welcomeMessage = `
@@ -888,21 +778,17 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
 - Ketik \`${PREFIX}menu\` untuk melihat daftar perintah lengkap.
                         `.trim();
 
-                        // 🛡️ Humanisasi: Kirim status typing dan jeda
                         await sock.sendPresenceUpdate('composing', from);
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay); 
-
                         await sock.sendMessage(from, { text: welcomeMessage });
                         PRIVATE_CHAT_STATUS.set(from, false); 
                         await sock.sendPresenceUpdate('available', from);
                         return;
                     }
 
-                    // Logika Session Lock
                     if (rawText === '2') {
                         PRIVATE_CHAT_STATUS.set(from, true);
-                         // 🛡️ Humanisasi: Kirim status typing dan jeda
                         await sock.sendPresenceUpdate('composing', from);
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay); 
@@ -913,7 +799,6 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     if (rawText === '1') {
                         PRIVATE_CHAT_STATUS.set(from, false);
                         CHAT_SESSIONS.delete(from); 
-                        // 🛡️ Humanisasi: Kirim status typing dan jeda
                         await sock.sendPresenceUpdate('composing', from);
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay); 
@@ -922,13 +807,9 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         return;
                     }
                     
-                    // Abaikan jika status non-aktif dan bukan command, dan bukan media/url
                     const isMediaMessage = messageType !== 'conversation' && messageType !== 'extendedTextMessage';
-                    
-                    // Pengecekan URL yang lebih luas
                     const isUrl = rawText.match(/(https?:\/\/(?:www\.)?youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com|facebook\.com|fb\.watch|tiktok\.com|t\.me|wa\.me|chat\.whatsapp\.com)/i);
 
-                    
                     if (currentStatus === false && !messageText.toLowerCase().startsWith(PREFIX) && !isMediaMessage && !isUrl) {
                         return; 
                     }
@@ -938,17 +819,14 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                 
                 if (command === `${PREFIX}norek`) {
                     const imagePath = path.join(__dirname, 'assets', 'norek_info.png'); 
-                    // 🛡️ STRATEGI ANTI-SPAM: Modifikasi caption agar tidak statis/spammy
                     const caption = `*💸 Info Rekening (PENTING):*\n\nInformasi ini untuk transfer dana yang aman. Pastikan nama penerima sudah benar.\n\nBerikut adalah detail dan QR Code untuk mempermudah transaksi. Terima kasih.`;
                     await handleSendImageCommand(sock, from, imagePath, caption);
                     return;
                 }
                 if (command === `${PREFIX}menu`) {
-                    // 🛡️ Humanisasi: Kirim status typing dan jeda
                     await sock.sendPresenceUpdate('composing', from);
                     const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                     await sleep(delay); 
-                    
                     await sock.sendMessage(from, { text: setting.GEMINI_MENU });
                     await sock.sendPresenceUpdate('available', from);
                     return;
@@ -969,12 +847,10 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     if (args.length > 0) {
                         await handleImageGeneration(sock, from, args);
                     } else {
-                        // 🛡️ Humanisasi: Kirim status typing dan jeda
                         await sock.sendPresenceUpdate('composing', from);
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay);
-                        
-                        await sock.sendMessage(from, { text: "Mohon berikan deskripsi gambar yang ingin Anda buat, contoh: `"+ PREFIX +"draw seekor anjing detektif mengenakan topi fedora, gaya noir`" });
+                        await sock.sendMessage(from, { text: "Mohon berikan deskripsi gambar yang ingin Anda buat, contoh: `"+ PREFIX +"draw seekor anjing detektif mengenakan topi fedora, gaya noir.`" });
                         await sock.sendPresenceUpdate('available', from);
                     }
                     return;
@@ -993,20 +869,16 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                 const isMentionedInGroup = isGroup && isBotMentioned(m, sock);
                 const isSessionActiveInPrivate = !isGroup && PRIVATE_CHAT_STATUS.get(from) === true;
                 
-                // Set isGeminiQuery: Bot merespons jika:
-                // 1. Di grup DAN di-mention.
-                // 2. Di chat pribadi DAN sesi aktif.
                 if (isMentionedInGroup || isSessionActiveInPrivate) {
                     isGeminiQuery = true;
                 } else if (isGroup) {
-                    return; // Di grup dan tidak di-mention, abaikan
+                    return; 
                 }
 
                 if (isMentionedInGroup) {
                     // --- LOGIKA PENGHAPUSAN MENTION ---
                     const botJidRaw = sock.user?.id?.split(':')[0]; 
                     if (botJidRaw) {
-                        // Regex untuk menghapus @[nomorbot] di mana pun dalam teks
                         const mentionRegex = new RegExp(`@${botJidRaw}`, 'g');
                         queryText = queryText.replace(mentionRegex, '').trim();
                     }
@@ -1014,7 +886,6 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                 
                 // Helper untuk download dan pengecekan ukuran media
                 const downloadAndCheckSize = async (msg, type) => {
-                    // Menggunakan fileLength yang aman (bisa null/undefined)
                     const fileSize = msg.fileLength ? Number(msg.fileLength) : 0;
                     const maxSize = type === 'document' ? MAX_DOC_SIZE_BYTES : MAX_MEDIA_SIZE_BYTES;
 
@@ -1034,7 +905,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                 
                 // A1. Pesan Gambar Langsung atau Balasan Gambar
                 if (messageType === 'imageMessage' || m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage) {
-                    isGeminiQuery = true; // Set query flag jika ada media
+                    isGeminiQuery = true; 
                     const imageMsg = messageType === 'imageMessage' ? m.message.imageMessage : m.message.extendedTextMessage.contextInfo.quotedMessage.imageMessage;
                     const buffer = await downloadAndCheckSize(imageMsg, 'image');
 
@@ -1042,13 +913,12 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     
                     const qrData = await decodeQrCode(buffer);
                     if (qrData) {
-                        // 🛡️ Humanisasi: Kirim status typing dan jeda untuk respons QR
                         await sock.sendPresenceUpdate('composing', from);
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay); 
                         
                         await sock.sendMessage(from, { text: `*✅ QR Code Ditemukan!*:\n\`\`\`\n${qrData}\n\`\`\`` });
-                        await sock.sendPresenceUpdate('available', from); // Kembali ke available setelah pesan info QR
+                        await sock.sendPresenceUpdate('available', from); 
                         
                         const qrPrompt = `QR Code di gambar ini berisi data: "${qrData}". Analisis data QR Code ini dan juga gambar keseluruhan, lalu balas pesan ini.`;
                         queryText = queryText.length > 0 ? `${qrPrompt}\n\n*Instruksi Pengguna Tambahan:*\n${queryText}` : qrPrompt;
@@ -1059,7 +929,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                 
                 // A2. Pesan Video Langsung atau Balasan Video
                 else if (messageType === 'videoMessage' || m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage) {
-                    isGeminiQuery = true; // Set query flag jika ada media
+                    isGeminiQuery = true; 
                     const videoMsg = messageType === 'videoMessage' ? m.message.videoMessage : m.message.extendedTextMessage.contextInfo.quotedMessage.videoMessage;
                     const buffer = await downloadAndCheckSize(videoMsg, 'video');
                     
@@ -1069,7 +939,7 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     mediaParts.push(bufferToGenerativePart(buffer, videoMsg.mimetype));
                 }
                 
-                // B. Pemrosesan Dokumen (HANYA PDF/Teks)
+                // B. Pemrosesan Dokumen
                 else if (messageType === 'documentMessage' || m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.documentMessage) {
                     const documentMsg = messageType === 'documentMessage' 
                         ? m.message.documentMessage 
@@ -1083,11 +953,10 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         return;
                     }
 
-                    // List mime types yang didukung: HANYA PDF, dan tipe teks/kode lain (yang didukung native oleh Gemini API)
                     const isSupported = mimeType.includes('pdf') || mimeType.includes('text') || mimeType.includes('json') || mimeType.includes('javascript');
 
                     if (isSupported) {
-                        isGeminiQuery = true; // Set query flag jika ada media/dokumen
+                        isGeminiQuery = true; 
                         await sock.sendPresenceUpdate('composing', from); 
 
                         const stream = await downloadContentFromMessage(documentMsg, 'document');
@@ -1099,40 +968,35 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         documentExtractedText = await extractTextFromDocument(buffer, mimeType);
                         
                         if (!documentExtractedText) {
-                            // Jika null, kirim buffer langsung ke Gemini (untuk PDF, TXT, dll.)
                             mediaParts.push(bufferToGenerativePart(buffer, mimeType));
                             console.log(`[AGENT MOLE API] File ${mimeType} dikirim langsung ke Agent Mole AI.`); 
                         } else {
-                            // Jika mengembalikan string (yang berarti tipe file tidak didukung)
                             await sock.sendPresenceUpdate('composing', from);
                             const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                             await sleep(delay);
-
                             await sock.sendMessage(from, { text: `⚠️ Maaf, tipe file dokumen \`${mimeType}\` belum didukung. Agent Mole hanya mendukung *PDF, TXT, dan tipe file kode/teks* lainnya.` });
                             await sock.sendPresenceUpdate('available', from);
                             return;
                         }
 
                     } else {
-                        // 🛡️ Humanisasi: Jeda sebelum kirim pesan error
                         await sock.sendPresenceUpdate('composing', from);
                         const delay = Math.floor(Math.random() * (RANDOM_DELAY_MAX - RANDOM_DELAY_MIN + 1)) + RANDOM_DELAY_MIN;
                         await sleep(delay);
-
                         await sock.sendMessage(from, { text: `⚠️ Maaf, tipe file dokumen \`${mimeType}\` belum didukung. Agent Mole hanya mendukung *PDF, TXT, dan tipe file kode/teks* lainnya.` });
                         await sock.sendPresenceUpdate('available', from);
                         return;
                     }
                 }
                 
-                // C. Deteksi Voice Note/Audio (AKTIF)
+                // C. Deteksi Voice Note/Audio
                 else if (messageType === 'audioMessage' || m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.audioMessage) {
                     const audioMsg = messageType === 'audioMessage' 
                         ? m.message.audioMessage 
                         : m.message.extendedTextMessage.contextInfo.quotedMessage.audioMessage;
                     
                     if (audioMsg.mimetype.includes('audio')) {
-                        isGeminiQuery = true; // Set query flag jika ada media
+                        isGeminiQuery = true; 
                         const buffer = await downloadAndCheckSize(audioMsg, 'audio');
                         
                         if (!buffer) { await sock.sendPresenceUpdate('available', from); return; }
@@ -1141,26 +1005,21 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                         
                         mediaParts.push(bufferToGenerativePart(buffer, audioMsg.mimetype));
                         
-                        // Prompt Interaktif Default untuk Audio (Hanya diterapkan jika query teks kosong)
                         if (queryText.length === 0) {
-                            // *** MODIFIKASI PROMPT EKSPLISIT ***
                             queryText = (
-                                'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal (misalnya: berita, harga, cuaca), *Gunakan Tool Google Search (Web Search)* untuk mendapatkan jawaban yang akurat. ' +
+                                'Transkripsikan voice note/audio ini ke teks. *WAJIB*: Jika konten transkripsi berisi pertanyaan yang memerlukan fakta, data terbaru, atau informasi eksternal, *Gunakan Tool Google Search (Web Search)* untuk mendapatkan jawaban yang akurat. ' +
                                 'Setelah itu, balaslah isi pesan tersebut dengan jawaban yang relevan dan personal. Di akhir jawaban Anda, berikan juga transkripsi dan ringkasan Voice Note sebagai referensi.'
                             );
-                            // ***************************************************************
                         }
                     }
                 }
                 
                 // D1. Deteksi URL YouTube 
                 const youtubeUrl = extractYoutubeUrl(queryText);
-                let youtubePart = null;
                 
                 if (youtubeUrl) {
-                    isGeminiQuery = true; // Set query flag jika ada URL
-                    youtubePart = uriToGenerativePart(youtubeUrl, 'video/youtube'); 
-                    mediaParts.push(youtubePart);
+                    isGeminiQuery = true; 
+                    mediaParts.push(uriToGenerativePart(youtubeUrl, 'video/youtube')); 
                     queryText = queryText.replace(youtubeUrl, '').trim(); 
                 }
 
@@ -1169,18 +1028,15 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
 
                 if (instagramUrl) {
                     isGeminiQuery = true;
-                    // Hapus URL dari query teks agar tidak redundan
                     queryText = queryText.replace(instagramUrl, '').trim(); 
                     
-                    // SUNATKAN INSTRUKSI KHUSUS
                     const instagramInstruction = (
-                         `*ANALISIS SOSIAL MEDIA - INSTAGRAM:* URL Instagram terdeteksi: \`${instagramUrl}\`. ` +
-                         `Gunakan Tool Google Search (Web Search) untuk mengidentifikasi konten publik yang terkait dengan URL ini dan subjeknya. ` +
-                         `Lakukan analisis ancaman profil/konten berdasarkan URL ini dan semua informasi yang berhasil Anda temukan. ` +
-                         `*PERHATIAN*: Anda tidak memiliki akses ke konten pribadi atau login Instagram. Fokus pada informasi publik yang terindeks.`
+                         `*ANALISIS OSINT - INSTAGRAM:* URL Instagram terdeteksi: \`${instagramUrl}\`. ` +
+                         `Gunakan Tool Google Search (Web Search) untuk mengidentifikasi konten publik (bio, deskripsi, komentar, tanggal bergabung) yang terkait dengan URL ini. ` +
+                         `Lakukan analisis ancaman profil/konten berdasarkan informasi publik yang ditemukan. ` +
+                         `*PERHATIAN*: Anda hanya boleh fokus pada informasi publik yang terindeks.`
                     );
                     
-                    // Gabungkan instruksi baru dengan query yang tersisa
                     queryText = queryText.length > 0 ? `${instagramInstruction}\n\n*Permintaan Pengguna:*\n${queryText}` : instagramInstruction;
                 }
                 
@@ -1193,16 +1049,17 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     isGeminiQuery = true;
                     queryText = queryText.replace(otherSocialUrl, '').trim(); 
                     
+                    const platform = otherSocialUrl.includes('facebook') ? 'Facebook' : (otherSocialUrl.includes('x.com') || otherSocialUrl.includes('twitter.com') ? 'X/Twitter' : 'TikTok');
+                    
                     socialMediaInstruction = (
-                         `*ANALISIS SOSIAL MEDIA - TERDETEKSI:* URL ${otherSocialUrl.includes('facebook') ? 'Facebook' : (otherSocialUrl.includes('x.com') || otherSocialUrl.includes('twitter.com') ? 'X/Twitter' : 'TikTok')} terdeteksi: \`${otherSocialUrl}\`. ` +
-                         `Gunakan Tool Google Search (Web Search) untuk mengidentifikasi konten publik yang terkait dengan URL ini dan subjeknya. ` +
-                         `Lakukan analisis ancaman profil/konten berdasarkan URL ini dan semua informasi publik yang berhasil Anda temukan. ` +
-                         `*PERHATIAN*: Anda tidak boleh mencoba akses login atau konten pribadi. Fokus pada informasi publik yang terindeks.`
+                         `*ANALISIS OSINT - ${platform}:* URL ${platform} terdeteksi: \`${otherSocialUrl}\`. ` +
+                         `Gunakan Tool Google Search (Web Search) untuk mengidentifikasi konten publik (bio, deskripsi, komentar, tanggal bergabung) yang terkait dengan URL ini. ` +
+                         `Lakukan analisis ancaman profil/konten berdasarkan informasi publik yang ditemukan. ` +
+                         `*PERHATIAN*: Anda hanya boleh fokus pada informasi publik yang terindeks.`
                     );
                 } 
                 else if (messagingInfo) {
                     isGeminiQuery = true;
-                    // Hapus info Telegram/WhatsApp dari query teks
                     queryText = queryText.replace(messagingInfo.telegram || '', '').replace(messagingInfo.whatsapp || '', '').trim();
                     
                     let platform = messagingInfo.telegram ? 'Telegram' : 'WhatsApp';
@@ -1211,35 +1068,26 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                     socialMediaInstruction = (
                          `*ANALISIS PLATFORM CHAT - TERDETEKSI:* Informasi ${platform} terdeteksi: \`${infoData}\`. ` +
                          `Gunakan Tool Google Search (Web Search) untuk mencari tautan grup, username, atau informasi publik yang terkait dengan data ini. ` +
-                         `Berikan analisis risiko keamanan atau potensi ancaman yang terkait. ` +
-                         `*PERHATIAN*: Bot tidak dapat mengakses pesan pribadi. Fokus pada informasi yang tersedia di indeks publik.`
+                         `Berikan analisis risiko keamanan atau potensi ancaman yang terkait.`
                     );
                 }
 
-                // F. Gabungkan Instruksi Sosial Media (BARU)
+                // F. Gabungkan Instruksi Sosial Media
                 if (socialMediaInstruction) {
                     queryText = queryText.length > 0 ? `${socialMediaInstruction}\n\n*Permintaan Pengguna:*\n${queryText}` : socialMediaInstruction;
                 }
                 
-                // G. Perintah Teks dan Gabungkan Query
+                // G. Gabungkan Query Dokumen dan Query Default
                 if (documentExtractedText) {
                     queryText = `${documentExtractedText}\n\n*Permintaan Analisis Pengguna:*\n${queryText.length > 0 ? queryText : 'Mohon analisis dokumen ini.'}`;
-                } else if (youtubePart && queryText.length === 0) {
-                    queryText = 'Mohon berikan ringkasan yang detail dan analisis mendalam dari video YouTube ini. Sertakan poin-pun penting dan kesimpulan.';
                 } else if (mediaParts.length > 0 && queryText.length === 0) {
-                    const mediaType = mediaParts[0].inlineData?.mimeType.startsWith('image') ? 'gambar' : 'dokumen/file';
-                    // Cek jika mediaParts hanya berisi URL (YouTube/Instagram/URL Media Sosial lainnya)
-                    if (mediaParts.every(p => !p.inlineData)) {
-                       // Biarkan query yang sudah dibuat oleh logika URL sebelumnya
-                    } else if (mediaParts[0].inlineData?.mimeType.startsWith('audio')) {
-                        // Prompt audio sudah ditangani di bagian C
-                    } else {
+                     if (mediaParts.every(p => !p.fileData) && !mediaParts[0].inlineData?.mimeType.startsWith('audio')) {
+                        const mediaType = mediaParts[0].inlineData?.mimeType.startsWith('image') ? 'gambar' : 'dokumen/file';
                         queryText = `Mohon analisis ${mediaType} yang terlampir ini secara mendalam.`;
-                    }
+                     }
                 }
                 
                 // --- Eksekusi Agent Mole AI ---
-                // Final check: Pastikan bot merespons jika isGeminiQuery true ATAU ada query teks
                 if (isGeminiQuery || queryText.length > 0 || extractDangerousUrl(messageText).length > 0) {
                     await handleGeminiRequest(sock, from, queryText, mediaParts);
                     return;
@@ -1251,11 +1099,9 @@ dan terhubung dengan darkweb dan internet untuk pencarian .
                 }
 
             } catch (e) {
-                // Jaring pengaman terakhir untuk mencegah bot mati total
                 console.error("-----------------------------------------------------");
                 console.error("🚨 CRITICAL: UNHANDLED ERROR IN MESSAGES.UPSERT:", e);
                 console.error("-----------------------------------------------------");
-                // Tidak perlu mengirim pesan balasan karena ini adalah error internal
             }
         });
 
