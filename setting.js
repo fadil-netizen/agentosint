@@ -6,8 +6,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 // --- KONFIGURASI BOT INTI ---
 const PREFIX = '!'; // Awalan perintah bot
-// 💡 TEMPAT MENGISI NOMOR: Ganti dengan nomor JID Anda untuk Laporan Status
-const TARGET_JID = '6287876611960@s.whatsapp.net'; 
+// 💡 NOMOR JID TARGET TELAH DIHAPUS
 
 // --- KONFIGURASI GEMINI ---
 
@@ -88,7 +87,6 @@ module.exports = {
     MODELS,
     SMART_MODE_SYSTEM_INSTRUCTION,
     GOOGLE_SEARCH_CONFIG,
-    TARGET_JID,
     GEMINI_MENU,
     PRIVATE_CHAT_STATUS
 };
