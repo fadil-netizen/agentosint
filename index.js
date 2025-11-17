@@ -28,7 +28,6 @@ const RANDOM_DELAY_MAX = 5000;  // 5 detik (Delay maksimum mengetik/merespon)
 const PROCESS_DELAY_MIN = 3000; // 3 detik (Waktu proses AI/Loading)
 const PROCESS_DELAY_MAX = 10000; // 10 detik
 const API_TIMEOUT_MS = 60000; // Timeout API 60 detik (1 menit)
-const STATUS_REPORT_INTERVAL_MS = 2 * 60 * 1000; // 2 menit
 const MAX_RETRIES = 5; // KONFIGURASI RETRY (5x)
 
 // --- KONSTANTA DARI SETTING.JS ---
@@ -40,7 +39,6 @@ const MODELS = setting.MODELS;
 const SMART_MODE_SYSTEM_INSTRUCTION = setting.SMART_MODE_SYSTEM_INSTRUCTION; 
 const GOOGLE_SEARCH_CONFIG = setting.GOOGLE_SEARCH_CONFIG; 
 const PRIVATE_CHAT_STATUS = setting.PRIVATE_CHAT_STATUS; 
-const TARGET_JID = setting.TARGET_JID; 
 // ------------------------------------
 
 
@@ -60,41 +58,6 @@ function checkAntiSpam(jid) {
     }
     ANTI_SPAM_MAP.set(jid, recentMessages);
     return recentMessages.length > SPAM_THRESHOLD;
-}
-
-async function sendStatusReport(sock, targetJid) {
-    if (sock.user && sock.ws.isOpen) {
-        console.log(`[STATUS REPORT] Mengirim laporan status ke ${targetJid}`);
-        const now = new Date();
-        const serverTime = now.toLocaleString('id-ID', {
-            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-            hour: '2-digit', minute: '2-digit', second: '2-digit',
-            timeZoneName: 'short', timeZone: 'Asia/Jakarta'
-        });
-
-        const statusMessage = `
-*🚨 LAPORAN STATUS AGENT MOLE 🚨*
-Bot Aktif dan Terhubung ke WhatsApp.
-
-*Waktu Laporan:* ${serverTime}
-*Mode Default:* ${setting.MODELS.DEFAULT}
-*Sesi Aktif:* ${setting.CHAT_SESSIONS.size} Sesi
-*Status Koneksi:* ✅ Terbuka (Open)
-
-*Instruksi:* Kirim pesan untuk melanjutkan penyelidikan.
-        `.trim();
-
-        try {
-            await sock.sendPresenceUpdate('composing', targetJid); 
-            await sleep(1000); 
-            await sock.sendMessage(targetJid, { text: statusMessage });
-            await sock.sendPresenceUpdate('available', targetJid);
-        } catch (error) {
-            console.error("[STATUS REPORT ERROR] Gagal mengirim pesan status:", error.message);
-        }
-    } else {
-        console.log("[STATUS REPORT SKIP] Koneksi belum siap atau bot belum login.");
-    }
 }
 
 // --- FUNGSI HELPER MULTIMODAL & OSINT ---
@@ -715,12 +678,7 @@ async function startSock() {
                 }
             } else if (connection === 'open') {
                 console.log('Bot siap digunakan! Agent Mole Aktif.');
-                
-                // Jadwalkan laporan status berulang 
-                sendStatusReport(sock, TARGET_JID); 
-                setInterval(() => {
-                    sendStatusReport(sock, TARGET_JID);
-                }, STATUS_REPORT_INTERVAL_MS);
+                // Laporan status otomatis telah dihapus dari sini
             }
         });
 
